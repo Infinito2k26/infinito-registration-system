@@ -1,0 +1,271 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum PaymentStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum RegistrationStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+}
+
+enum EntryStatus {
+  ENTERED
+  REJECTED
+}
+
+enum EmailStatus {
+  PENDING
+  PROCESSING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+/// What Resend reported after the email left us (via its webhook).
+enum EmailDeliveryStatus {
+  DELIVERED
+  DELAYED
+  BOUNCED
+  COMPLAINED
+  FAILED
+}
+
+enum StaffRole {
+  /// Everything coordinators can do, plus managing staff accounts.
+  ADMIN
+  /// Registrations, payment verification, QR emails, entry information.
+  COORDINATOR
+  /// Gate only: scan QR, see entry details, mark entered.
+  VOLUNTEER
+}
+
+enum ActivityType {
+  SUBMITTED
+  UPDATED
+  PAYMENT_VERIFIED
+  PAYMENT_REJECTED
+  PAYMENT_UNVERIFIED
+  QR_EMAIL_QUEUED
+  QR_EMAIL_RESENT
+  ENTERED
+  ENTRY_DENIED
+}
+
+model Person {
+  id                String  @id @default(uuid()) @db.Uuid
+  /// Stored lowercased and trimmed; one person = one QR across all events.
+  email             String  @unique
+  name              String?
+  phone             String?
+  college           String?
+  /// Google Drive file IDs. Files stay private; the server proxies them to logged-in volunteers.
+  photoDriveId      String?
+  idDocumentDriveId String?
+  /// Random bearer token encoded in the QR URL (/p/<qrToken>). Created on the person's first verified
+  /// payment; kept in plain form so passes can be re-sent.
+  qrToken           String? @unique
+
+  /// Migration of past participants: token embedded in the pre-filled profile form link.
+  profileToken          String?   @unique
+  profileCompletedAt    DateTime?
+  profileReminderCount  Int       @default(0)
+  profileLastRemindedAt DateTime?
+
+  /// Set from Resend bounce/complaint webhooks.
+  emailBouncedAt    DateTime?
+  emailBounceReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  teamMembers   TeamMember[]
+  registrations Registration[]
+  entryLogs     EntryLog[]
+  emailOutbox   EmailOutbox[]
+
+  @@index([profileCompletedAt])
+}
+
+model Team {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  eventSlug    String
+  captainEmail String?
+  /// Google Form response ID the team was created from; makes webhook retries and resyncs idempotent.
+  responseId   String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  members       TeamMember[]
+  registrations Registration[]
+
+  @@unique([eventSlug, responseId])
+  @@index([eventSlug])
+}
+
+model TeamMember {
+  id        String   @id @default(uuid()) @db.Uuid
+  teamId    String   @db.Uuid
+  personId  String   @db.Uuid
+  role      String?
+  createdAt DateTime @default(now())
+
+  team   Team   @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, personId])
+  @@index([personId])
+}
+
+model Registration {
+  id                  String             @id @default(uuid()) @db.Uuid
+  eventSlug           String
+  personId            String             @db.Uuid
+  teamId              String?            @db.Uuid
+  transactionId       String?
+  paymentStatus       PaymentStatus      @default(PENDING)
+  status              RegistrationStatus @default(PENDING)
+  /// Rejection reason shown to coordinators and sent to the captain.
+  paymentRemarks      String?
+  /// Last verify/reject decision. Full history lives in RegistrationActivity.
+  paymentReviewedById String?            @db.Uuid
+  paymentReviewedAt   DateTime?
+  sourceForm          String?
+  sourceSheet         String?
+  sourceRow           Int?
+  responseId          String?
+  /// Gate entry. Set once with a conditional update (where enteredAt is null), so two simultaneous scans cannot both succeed.
+  enteredAt           DateTime?
+  enteredById         String?            @db.Uuid
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  person            Person                 @relation(fields: [personId], references: [id], onDelete: Cascade)
+  team              Team?                  @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  enteredBy         StaffUser?             @relation("RegistrationEnteredBy", fields: [enteredById], references: [id], onDelete: SetNull)
+  paymentReviewedBy StaffUser?             @relation("RegistrationReviewedBy", fields: [paymentReviewedById], references: [id], onDelete: SetNull)
+  activities        RegistrationActivity[]
+  emails            EmailOutbox[]
+  entryLogs         EntryLog[]
+
+  /// One registration per person per event; re-ingesting the same response updates it.
+  @@unique([eventSlug, personId])
+  @@index([eventSlug, paymentStatus])
+  @@index([transactionId])
+  @@index([teamId])
+}
+
+/// Append-only history of everything that happened to a registration.
+model RegistrationActivity {
+  id             String       @id @default(uuid()) @db.Uuid
+  registrationId String       @db.Uuid
+  type           ActivityType
+  /// Null for system actions (form sync, email worker).
+  actorId        String?      @db.Uuid
+  details        Json?
+  createdAt      DateTime     @default(now())
+
+  registration Registration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  actor        StaffUser?   @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([registrationId, createdAt])
+}
+
+/// Every scan outcome at the gate, successful or not.
+model EntryLog {
+  id             String      @id @default(uuid()) @db.Uuid
+  personId       String      @db.Uuid
+  registrationId String?     @db.Uuid
+  eventSlug      String
+  volunteerId    String?     @db.Uuid
+  status         EntryStatus @default(ENTERED)
+  enteredAt      DateTime    @default(now())
+  gate           String?
+  notes          String?
+
+  person       Person        @relation(fields: [personId], references: [id], onDelete: Cascade)
+  registration Registration? @relation(fields: [registrationId], references: [id], onDelete: SetNull)
+  volunteer    StaffUser?    @relation(fields: [volunteerId], references: [id], onDelete: SetNull)
+
+  @@index([personId, eventSlug])
+  @@index([eventSlug, enteredAt])
+  @@index([registrationId])
+}
+
+model StaffUser {
+  id             String    @id @default(uuid()) @db.Uuid
+  email          String    @unique
+  name           String?
+  role           StaffRole @default(VOLUNTEER)
+  /// Pending magic-link login; single use, cleared on sign-in.
+  magicTokenHash String?   @unique
+  tokenExpiry    DateTime?
+  active         Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  entryLogs             EntryLog[]
+  sessions              StaffSession[]
+  enteredRegistrations  Registration[]         @relation("RegistrationEnteredBy")
+  reviewedRegistrations Registration[]         @relation("RegistrationReviewedBy")
+  activities            RegistrationActivity[]
+  triggeredEmails       EmailOutbox[]
+}
+
+/// One row per signed-in device, so staff can be signed in on several phones.
+model StaffSession {
+  id          String    @id @default(uuid()) @db.Uuid
+  staffUserId String    @db.Uuid
+  tokenHash   String    @unique
+  expiresAt   DateTime
+  lastSeenAt  DateTime  @default(now())
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  staffUser StaffUser @relation(fields: [staffUserId], references: [id], onDelete: Cascade)
+
+  @@index([staffUserId])
+}
+
+model EmailOutbox {
+  id                String               @id @default(uuid()) @db.Uuid
+  personId          String?              @db.Uuid
+  /// Set for participant emails about a specific registration (QR pass, payment issue).
+  registrationId    String?              @db.Uuid
+  /// Staff member whose action queued this email (verify, resend); null for automatic emails.
+  triggeredById     String?              @db.Uuid
+  toEmail           String
+  /// e.g. "qr-pass:<registrationId>:initial". Enqueueing the same key twice is a no-op; also sent to Resend as its Idempotency-Key.
+  idempotencyKey    String               @unique
+  subject           String
+  template          String?
+  payload           Json?
+  status            EmailStatus          @default(PENDING)
+  attempts          Int                  @default(0)
+  sendAt            DateTime             @default(now())
+  sentAt            DateTime?
+  /// Resend email ID, used to match delivery webhooks back to the row.
+  providerMessageId String?              @unique
+  deliveryStatus    EmailDeliveryStatus?
+  deliveryUpdatedAt DateTime?
+  lastError         String?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  person       Person?       @relation(fields: [personId], references: [id], onDelete: SetNull)
+  registration Registration? @relation(fields: [registrationId], references: [id], onDelete: SetNull)
+  triggeredBy  StaffUser?    @relation(fields: [triggeredById], references: [id], onDelete: SetNull)
+
+  @@index([status, sendAt])
+  @@index([registrationId, template])
+}
