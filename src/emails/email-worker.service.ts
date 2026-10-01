@@ -55,6 +55,9 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
       this.logger.warn('RESEND_API_KEY is not set; emails are printed to the log instead of sent');
       return new ConsoleTransport();
     }
+    if (this.config.isProduction && process.env.EMAIL_TEST_RECIPIENT) {
+      this.logger.warn('EMAIL_TEST_RECIPIENT is set but ignored in production; emails go to real recipients');
+    }
     const problems = this.config.emailConfigProblems();
     if (problems.length > 0) {
       this.logger.error(`Email sending disabled, fix .env: ${problems.join('; ')}`);

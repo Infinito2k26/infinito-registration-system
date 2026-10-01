@@ -18,6 +18,7 @@ export interface AuthStaff {
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 const newToken = () => randomBytes(32).toString('base64url');
 const SEEN_UPDATE_MS = 5 * 60 * 1000;
+const LOGIN_LINK_COOLDOWN_MS = 60 * 1000;
 
 @Injectable()
 export class AuthService implements OnApplicationBootstrap {
@@ -52,8 +53,15 @@ export class AuthService implements OnApplicationBootstrap {
       this.logger.warn(`Login link requested for unknown/inactive ${email}`);
       return;
     }
-    const token = newToken();
     const ttlMinutes = this.config.magicLinkTtlMinutes;
+    // Per-account cooldown on top of the per-IP throttle, so a staff inbox (and the email
+    // quota) cannot be flooded from many IPs. The previous link stays valid meanwhile.
+    const issuedAt = staff.tokenExpiry ? staff.tokenExpiry.getTime() - ttlMinutes * 60_000 : 0;
+    if (Date.now() - issuedAt < LOGIN_LINK_COOLDOWN_MS) {
+      this.logger.warn(`Login link for ${email} requested again within cooldown; not sent`);
+      return;
+    }
+    const token = newToken();
     const tokenHash = sha256(token);
     await this.prisma.$transaction(async (tx) => {
       await tx.staffUser.update({

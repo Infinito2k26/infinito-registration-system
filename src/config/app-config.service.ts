@@ -10,9 +10,29 @@ export class AppConfig {
 
   constructor(private readonly config: ConfigService) {
     const secret = this.str('APP_SECRET');
-    if (!secret && this.isProduction) throw new Error('APP_SECRET must be set in production');
-    if (!secret) this.logger.warn('APP_SECRET not set; using a random one (forms break on restart)');
+    if (!secret && !this.isProduction) {
+      this.logger.warn('APP_SECRET not set; using a random one (forms break on restart)');
+    }
     this.appSecret = secret || randomBytes(32).toString('hex');
+    if (this.isProduction) {
+      const problems = this.productionProblems();
+      if (problems.length) throw new Error(`Refusing to start in production: ${problems.join('; ')}`);
+    }
+  }
+
+  /** Settings that are tolerable in development but unsafe in production. */
+  productionProblems(): string[] {
+    const problems: string[] = [];
+    if (this.str('APP_SECRET').length < 32) problems.push('APP_SECRET must be at least 32 characters');
+    const webhookSecret = this.str('FORMS_WEBHOOK_SECRET');
+    if (webhookSecret.length < 24 || webhookSecret === 'change-this-secret') {
+      problems.push('FORMS_WEBHOOK_SECRET must be a random value of at least 24 characters');
+    }
+    if (!this.str('APP_BASE_URL').startsWith('https://')) {
+      problems.push('APP_BASE_URL must be the public https:// URL');
+    }
+    if (!this.str('RESEND_API_KEY')) problems.push('RESEND_API_KEY must be set');
+    return problems;
   }
 
   get isProduction() {

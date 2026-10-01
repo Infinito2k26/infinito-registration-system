@@ -4,7 +4,7 @@
  * Install once per event, in the form's RESPONSE SPREADSHEET (Extensions -> Apps Script):
  *   1. Paste this file.
  *   2. Project Settings -> Script properties:
- *        WEBHOOK_URL     https://<server>/webhooks/forms/submit
+ *        WEBHOOK_URL     https://<server>/webhooks/forms/submit  (or just https://<server>)
  *        WEBHOOK_SECRET  same value as the server's FORMS_WEBHOOK_SECRET
  *        EVENT_SLUG      e.g. code-sprint  (lowercase, hyphens)
  *   3. Run `setup` once from the editor and approve the permissions.
@@ -23,6 +23,7 @@ var HELPER_COLUMNS = ['Status', 'Response ID'];
 var LEGACY_COLUMNS = ['Payment', 'Remarks'];
 var SKIP_COLUMNS = ['Timestamp', 'Email Address'].concat(HELPER_COLUMNS, LEGACY_COLUMNS);
 var MAX_ATTEMPTS = 3;
+var WEBHOOK_PATH = '/webhooks/forms/submit';
 
 function setup() {
   var sheet = getResponseSheet_();
@@ -81,7 +82,7 @@ function resyncSelected() {
 
 function syncRow_(sheet, row) {
   var props = PropertiesService.getScriptProperties();
-  var url = props.getProperty('WEBHOOK_URL');
+  var url = normalizeWebhookUrl_(props.getProperty('WEBHOOK_URL'));
   var secret = props.getProperty('WEBHOOK_SECRET');
   var eventSlug = props.getProperty('EVENT_SLUG');
   if (!url || !secret || !eventSlug) {
@@ -147,6 +148,7 @@ function post_(url, secret, payload) {
         return text;
       }
       if (code === 401) return '❌ Webhook secret mismatch. Ask the tech team.';
+      if (code === 404) return '⚠ Not synced (HTTP 404: check the WEBHOOK_URL script property). Use Infinito → Resync unsent rows.';
       if (code === 400 || code === 409 || code === 422) {
         return '❌ ' + (body.errors || ['HTTP ' + code]).join(' | ');
       }
@@ -157,6 +159,13 @@ function post_(url, secret, payload) {
     if (attempt < MAX_ATTEMPTS) Utilities.sleep(2000 * attempt);
   }
   return '⚠ Not synced (' + lastProblem + '). Use Infinito → Resync unsent rows.';
+}
+
+/** Accepts the full endpoint or just the server's base URL. */
+function normalizeWebhookUrl_(raw) {
+  var url = String(raw || '').trim().replace(/\/+$/, '');
+  if (!url) return '';
+  return url.slice(-WEBHOOK_PATH.length) === WEBHOOK_PATH ? url : url + WEBHOOK_PATH;
 }
 
 function formatCell_(value) {

@@ -3,7 +3,9 @@
   var gate = '';
   try {
     gate = localStorage.getItem('inf_gate') || '';
-  } catch (e) {}
+  } catch (e) {
+    // storage unavailable (private mode); the gate just isn't remembered
+  }
   document.querySelectorAll('.gate-field').forEach(function (input) {
     input.value = gate;
   });

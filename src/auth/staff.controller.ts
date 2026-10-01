@@ -86,13 +86,17 @@ export class StaffController {
   }
 
   @Post()
-  async save(@Body() body: Record<string, unknown>, @Res() res: Response) {
+  async save(@Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
     const parsed = staffForm.safeParse(body);
     if (!parsed.success) {
       setFlash(res, { type: 'error', text: 'Enter a valid email and role' }, this.config.secureCookies);
       return res.redirect(303, '/admin/staff');
     }
     const { email, name, role } = parsed.data;
+    if (email === req.staff!.email && role !== StaffRole.ADMIN) {
+      setFlash(res, { type: 'error', text: "You can't remove your own admin role" }, this.config.secureCookies);
+      return res.redirect(303, '/admin/staff');
+    }
     await this.prisma.staffUser.upsert({
       where: { email },
       create: { email, name: name || null, role },

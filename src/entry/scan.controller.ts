@@ -20,6 +20,14 @@ export function extractQrToken(code: string): string | null {
   return /^[\w-]{16,200}$/.test(trimmed) ? trimmed : null;
 }
 
+/** "2/4 of team entered" for multi-member teams; the team counts as entered once all members are in. */
+function teamProgress(team: { registrations: { enteredAt: Date | null }[] } | null) {
+  if (!team || team.registrations.length < 2) return null;
+  const total = team.registrations.length;
+  const entered = team.registrations.filter((r) => r.enteredAt).length;
+  return html`<p class="small ${entered === total ? '' : 'muted'}">${entered === total ? `Whole team entered (${total}/${total})` : `${entered}/${total} of team entered`}</p>`;
+}
+
 @Controller()
 @UseFilters(WebExceptionFilter)
 export class ScanController {
@@ -134,6 +142,7 @@ export class ScanController {
       }
       return html`<section class="card registration">
         <div class="reg-head"><h2>${eventName}</h2>${reg.team ? html`<span class="muted">Team ${reg.team.name}</span>` : null}</div>
+        ${teamProgress(reg.team)}
         ${verdict}
         ${manage && reg.team ? html`<p class="small"><a href="/admin/teams/${reg.team.id}">Open registration</a></p>` : null}
       </section>`;

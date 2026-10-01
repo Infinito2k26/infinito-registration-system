@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Query, Req, Res, UseFilters, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Post, Query, Req, Res, UseFilters, UseGuards } from '@nestjs/common';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { StaffRole } from '@prisma/client';
 import { Response } from 'express';
@@ -51,6 +51,7 @@ export class AuthController {
   }
 
   @Post('login')
+  @HttpCode(200)
   @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
   async requestLink(@Body() body: Record<string, unknown>, @Res() res: Response) {

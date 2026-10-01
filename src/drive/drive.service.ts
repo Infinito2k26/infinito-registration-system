@@ -16,7 +16,8 @@ export interface DriveFile {
 const MAX_BYTES = 10 * 1024 * 1024;
 const ALLOWED_TYPES = /^(image\/(jpeg|png|webp|gif|heic|heif)|application\/pdf)$/;
 const CACHE_TTL_MS = 10 * 60 * 1000;
-const CACHE_MAX = 200;
+/** Total bytes kept in memory; ID scans can be several MB each. */
+const CACHE_MAX_BYTES = 64 * 1024 * 1024;
 
 /**
  * Reads form uploads (photos, ID cards) from Google Drive with a service account,
@@ -30,6 +31,7 @@ export class DriveService {
   private accessToken: { value: string; expiresAt: number } | null = null;
   /** Small LRU so gate volunteers re-opening the same pass don't hit Drive each time. */
   private readonly cache = new Map<string, { file: DriveFile; at: number }>();
+  private cacheBytes = 0;
 
   constructor(config: AppConfig) {
     const json = config.googleServiceAccountJson;
@@ -50,19 +52,31 @@ export class DriveService {
     return this.account !== null;
   }
 
+  /** Never throws: missing, inaccessible or unsupported files (and Drive outages) return null. */
   async fetchFile(fileId: string): Promise<DriveFile | null> {
     if (!this.account || !/^[\w-]{10,200}$/.test(fileId)) return null;
+    try {
+      return await this.fetchFromDrive(fileId);
+    } catch (error) {
+      this.logger.warn(`Drive file ${fileId} unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
 
+  private async fetchFromDrive(fileId: string): Promise<DriveFile | null> {
     const cached = this.cache.get(fileId);
-    if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+    if (cached) {
       this.cache.delete(fileId);
-      this.cache.set(fileId, cached);
-      return cached.file;
+      if (Date.now() - cached.at < CACHE_TTL_MS) {
+        this.cache.set(fileId, cached); // re-insert = most recently used
+        return cached.file;
+      }
+      this.cacheBytes -= cached.file.data.length;
     }
 
     const res = await fetch(
       `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`,
-      { headers: { Authorization: `Bearer ${await this.token()}` } },
+      { headers: { Authorization: `Bearer ${await this.token()}` }, signal: AbortSignal.timeout(15_000) },
     );
     if (!res.ok) {
       this.logger.warn(`Drive file ${fileId}: HTTP ${res.status}`);
@@ -78,7 +92,12 @@ export class DriveService {
 
     const file = { contentType, data };
     this.cache.set(fileId, { file, at: Date.now() });
-    if (this.cache.size > CACHE_MAX) this.cache.delete(this.cache.keys().next().value!);
+    this.cacheBytes += data.length;
+    for (const [key, entry] of this.cache) {
+      if (this.cacheBytes <= CACHE_MAX_BYTES) break;
+      this.cache.delete(key);
+      this.cacheBytes -= entry.file.data.length;
+    }
     return file;
   }
 
@@ -100,6 +119,7 @@ export class DriveService {
 
     const res = await fetch(tokenUri, {
       method: 'POST',
+      signal: AbortSignal.timeout(15_000),
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',

@@ -35,6 +35,10 @@ export class DriveController {
         'Cache-Control': 'private, max-age=300',
         'Content-Disposition': 'inline',
         'X-Content-Type-Options': 'nosniff',
+        // Images opened directly can't run anything. (Not for PDFs: browsers won't render them sandboxed.)
+        ...(file.contentType.startsWith('image/')
+          ? { 'Content-Security-Policy': "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox" }
+          : {}),
       })
       .send(file.data);
   }

@@ -12,11 +12,15 @@
 
   try {
     gate.value = localStorage.getItem(GATE_KEY) || '';
-  } catch (e) {}
+  } catch (e) {
+    // storage unavailable (private mode); the gate just isn't remembered
+  }
   gate.addEventListener('change', function () {
     try {
       localStorage.setItem(GATE_KEY, gate.value.trim());
-    } catch (e) {}
+    } catch (e) {
+      // storage unavailable (private mode); the gate just isn't remembered
+    }
   });
 
   function tokenFrom(text) {

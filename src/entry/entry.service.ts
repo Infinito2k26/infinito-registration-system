@@ -22,7 +22,7 @@ export class EntryService {
         registrations: {
           orderBy: { eventSlug: 'asc' },
           include: {
-            team: { select: { id: true, name: true } },
+            team: { select: { id: true, name: true, registrations: { select: { enteredAt: true } } } },
             enteredBy: { select: { name: true, email: true } },
             entryLogs: {
               where: { status: EntryStatus.ENTERED },

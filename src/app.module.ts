@@ -13,6 +13,8 @@ import { PrismaModule } from './prisma/prisma.module';
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
+      // Tests configure everything explicitly and must never pick up real credentials from .env.
+      ignoreEnvFile: process.env.NODE_ENV === 'test',
     }),
     // Limits are set per route with @Throttle (login endpoints only).
     ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 100 }]),
