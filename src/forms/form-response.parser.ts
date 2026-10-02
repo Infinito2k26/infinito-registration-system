@@ -13,12 +13,36 @@ export interface ParsedMember {
   college?: string;
   photoDriveId?: string;
   idDocumentDriveId?: string;
+  rollNumber?: string;
+  /** Last 4 digits (shown to coordinators/volunteers). */
+  aadhaarLast4?: string;
+  /** Full 12 digits, only when valid. Stored ENCRYPTED (admin-only), never in plain text. */
+  aadhaarFull?: string;
+  aadhaarDriveId?: string;
+}
+
+/**
+ * Per-registration form details. The expected dates are the participant's PLANNED arrival and
+ * departure ("Check In Date" / "Check Out Date" in the form), never the actual gate times.
+ */
+export interface SubmissionDetails {
+  accommodation?: string;
+  accommodationPeriod?: string;
+  expectedArrivalText?: string;
+  expectedDepartureText?: string;
+  /** Parsed, as a UTC-midnight Date for a Postgres DATE column; undefined if missing/unparseable. */
+  expectedArrivalDate?: Date;
+  expectedDepartureDate?: Date;
+  remark?: string;
 }
 
 export interface ParsedSubmission {
   teamName?: string;
   transactionId?: string;
   members: ParsedMember[];
+  /** Event slugs from the form's Sports answer; empty = use the sheet's EVENT_SLUG. */
+  eventSlugs: string[];
+  details: SubmissionDetails;
 }
 
 export type ParseResult =
@@ -37,9 +61,66 @@ export function normalizeTitle(title: string): string {
     .toLowerCase()
     .replace(/\s+/g, ' ')
     .trim()
-    .replace(/\s*\*$/, '')
-    .replace(/\s*:$/, '')
-    .trim();
+    .replace(/[\s*:.?]+$/, '');
+}
+
+/** "Table Tennis" -> "table-tennis"; matches the EVENT_SLUG format. */
+export function slugify(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60)
+    .replace(/-+$/g, '');
+}
+
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+const FEST_TIME_ZONE = 'Asia/Kolkata';
+
+function ymd(year: number, month: number, day: number): string | undefined {
+  if (year < 100) year += 2000;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  const valid = date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+  return valid ? date.toISOString().slice(0, 10) : undefined;
+}
+
+/**
+ * A planned date as typed into / exported from the form, to "YYYY-MM-DD" (fest-local, India).
+ * Accepts YYYY-MM-DD, ISO timestamps (a date cell sent as UTC is converted back to India's date),
+ * DD/MM/YYYY (also with "-" or "."; day first, as used in India), "5 October 2026",
+ * "05 Oct 2026" and "October 5, 2026". Returns undefined for anything else.
+ */
+export function parseExpectedDate(value: string): string | undefined {
+  const t = value.trim();
+  let m = t.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return ymd(+m[1], +m[2], +m[3]);
+  if (/^\d{4}-\d{2}-\d{2}T/.test(t)) {
+    const instant = new Date(t);
+    if (Number.isNaN(instant.getTime())) return undefined;
+    return new Intl.DateTimeFormat('en-CA', { timeZone: FEST_TIME_ZONE }).format(instant);
+  }
+  m = t.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})$/);
+  if (m) return ymd(+m[3], +m[2], +m[1]);
+  m = t.match(/^(\d{1,2})(?:st|nd|rd|th)?[\s-]+([a-z]{3,9})\.?,?[\s-]+(\d{4})$/i);
+  if (m && MONTHS.includes(m[2].slice(0, 3).toLowerCase())) {
+    return ymd(+m[3], MONTHS.indexOf(m[2].slice(0, 3).toLowerCase()) + 1, +m[1]);
+  }
+  m = t.match(/^([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$/i);
+  if (m && MONTHS.includes(m[1].slice(0, 3).toLowerCase())) {
+    return ymd(+m[3], MONTHS.indexOf(m[1].slice(0, 3).toLowerCase()) + 1, +m[2]);
+  }
+  return undefined;
+}
+
+/** "YYYY-MM-DD" -> the Date Prisma stores in a DATE column. */
+export const dateOnly = (isoDate: string) => new Date(`${isoDate}T00:00:00.000Z`);
+
+/** Digits only; returns the last 4 when there are at least 4. */
+export function aadhaarLast4(value: string): { last4?: string; full?: string; valid: boolean } {
+  const digits = value.replace(/\D/g, '');
+  const valid = digits.length === 12;
+  return { last4: digits.length >= 4 ? digits.slice(-4) : undefined, full: valid ? digits : undefined, valid };
 }
 
 export function normalizeEmail(email: string): string {
@@ -127,12 +208,15 @@ export function parseFormResponse(
     const college = field('college');
     const photo = field('photo');
     const idDocument = field('idDocument');
+    const rollNumber = field('rollNumber');
+    const aadhaarNumber = field('aadhaarNumber');
+    const aadhaarPhoto = field('aadhaarPhoto');
 
     if (n === 1 && !email && name && context.respondentEmail) {
       email = context.respondentEmail;
     }
 
-    if (![name, email, phone, college, photo, idDocument].some(Boolean)) {
+    if (![name, email, phone, college, photo, idDocument, rollNumber, aadhaarNumber, aadhaarPhoto].some(Boolean)) {
       continue;
     }
 
@@ -167,6 +251,10 @@ export function parseFormResponse(
     if (idDocument && idDocumentIds.length === 0) {
       warnings.push(`${label}: ID upload not recognised`);
     }
+    const aadhaarIds = aadhaarPhoto ? extractDriveFileIds(aadhaarPhoto) : [];
+    if (aadhaarPhoto && aadhaarIds.length === 0) warnings.push(`${label}: Aadhaar upload not recognised`);
+    const aadhaar = aadhaarNumber ? aadhaarLast4(aadhaarNumber) : undefined;
+    if (aadhaar && !aadhaar.valid) warnings.push(`${label}: Aadhaar number should have 12 digits`);
 
     members.push({
       position: n,
@@ -177,6 +265,10 @@ export function parseFormResponse(
       college: college ?? teamCollege,
       photoDriveId: photoIds[0],
       idDocumentDriveId: idDocumentIds[0],
+      rollNumber: rollNumber?.replace(/\s+/g, ' ').slice(0, 60),
+      aadhaarLast4: aadhaar?.last4,
+      aadhaarFull: aadhaar?.full,
+      aadhaarDriveId: aadhaarIds[0],
     });
   }
 
@@ -192,11 +284,50 @@ export function parseFormResponse(
     errors.push('Transaction ID is missing');
   }
 
+  // answers.Sports (sent explicitly by the Apps Script) is the single source when present, even
+  // if empty; the other aliases (Sport / Event / Game) only apply when there is no Sports key.
+  const explicitSports = Object.entries(answers).find(([title]) => normalizeTitle(title) === 'sports');
+  const sportsAnswer = explicitSports
+    ? (Array.isArray(explicitSports[1]) ? explicitSports[1].join(', ') : explicitSports[1]).trim() || undefined
+    : pick(lookup, map.sports);
+  const eventSlugs = [
+    ...new Set((sportsAnswer ?? '').split(/[,;\n]/).map(slugify).filter(Boolean)),
+  ];
+  if (sportsAnswer && eventSlugs.length === 0) errors.push(`Sports "${sportsAnswer}" is not a valid event name`);
+  if (!sportsAnswer && map.requireSports) errors.push('Sports is missing: the sport/event must be chosen in the form');
+
   if (errors.length > 0) return { ok: false, errors };
 
+  const detail = (aliases: string[]) => pick(lookup, aliases)?.slice(0, 500);
+  const expected = (aliases: string[], label: string) => {
+    const text = detail(aliases);
+    const iso = text ? parseExpectedDate(text) : undefined;
+    // Optional: a missing or unreadable planned date never rejects the registration.
+    if (text && !iso) warnings.push(`${label} "${text}" is not a recognised date; kept as text`);
+    return { text, date: iso ? dateOnly(iso) : undefined };
+  };
+  const arrival = expected(map.expectedArrival, 'Check In Date (expected arrival)');
+  const departure = expected(map.expectedDeparture, 'Check Out Date (expected departure)');
+  if (arrival.date && departure.date && departure.date < arrival.date) {
+    warnings.push('Expected departure is before expected arrival');
+  }
   return {
     ok: true,
-    value: { teamName: pick(lookup, map.teamName), transactionId, members },
+    value: {
+      teamName: pick(lookup, map.teamName),
+      transactionId,
+      members,
+      eventSlugs,
+      details: {
+        accommodation: detail(map.accommodation),
+        accommodationPeriod: detail(map.accommodationPeriod),
+        expectedArrivalText: arrival.text,
+        expectedDepartureText: departure.text,
+        expectedArrivalDate: arrival.date,
+        expectedDepartureDate: departure.date,
+        remark: detail(map.remark),
+      },
+    },
     warnings,
   };
 }

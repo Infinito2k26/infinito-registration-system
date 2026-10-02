@@ -3,9 +3,11 @@ import { ActivityType, PaymentStatus, Prisma } from '@prisma/client';
 import { AppConfig } from '../config/app-config.service';
 import { EmailTemplate } from '../emails/email-templates';
 import { EmailOutboxService } from '../emails/email-outbox.service';
-import { ParsedSubmission } from '../forms/form-response.parser';
+import { ParsedMember, ParsedSubmission } from '../forms/form-response.parser';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityEntry, recordActivity } from './activity';
+import { encryptAadhaar } from './aadhaar-crypto';
+import { collegeDisplayName, collegeNameKey } from './college';
 
 export interface IngestSource {
   eventSlug: string;
@@ -16,6 +18,11 @@ export interface IngestSource {
   responseId: string;
 }
 
+/** One form row; it may register for several events (comma-separated Sports answer). */
+export interface IngestRequest extends Omit<IngestSource, 'eventSlug'> {
+  eventSlugs: string[];
+}
+
 export interface IngestResult {
   outcome: 'created' | 'updated';
   teamId: string;
@@ -23,6 +30,10 @@ export interface IngestResult {
   memberCount: number;
   queuedEmails: number;
   warnings: string[];
+}
+
+export interface IngestManyResult extends IngestResult {
+  events: string[];
 }
 
 /** The submission clashes with data that must not be changed automatically. Nothing was written. */
@@ -59,18 +70,97 @@ export class RegistrationsService {
    * A member registered for the same event in another team is moved here if that
    * registration is still unverified; otherwise the whole submission is rejected.
    */
-  async ingest(source: IngestSource, submission: ParsedSubmission): Promise<IngestResult> {
+  async ingest(request: IngestRequest, submission: ParsedSubmission): Promise<IngestManyResult> {
+    const { eventSlugs, ...base } = request;
     try {
-      return await this.prisma.$transaction((tx) => this.ingestInTx(tx, source, submission), {
-        maxWait: 10_000,
-        timeout: 20_000,
-      });
+      return await this.prisma.$transaction(
+        async (tx) => {
+          const results: IngestResult[] = [];
+          for (const eventSlug of eventSlugs) {
+            const result = await this.ingestInTx(tx, { ...base, eventSlug }, submission);
+            const prefix = eventSlugs.length > 1 ? `${this.config.eventName(eventSlug)}: ` : '';
+            results.push({ ...result, warnings: result.warnings.map((w) => prefix + w) });
+          }
+          const staleWarnings = await this.removeDroppedEvents(tx, base.responseId, eventSlugs);
+          return {
+            outcome: results.some((r) => r.outcome === 'created') ? 'created' : 'updated',
+            teamId: results[0].teamId,
+            teamName: results[0].teamName,
+            memberCount: results[0].memberCount,
+            queuedEmails: results.reduce((n, r) => n + r.queuedEmails, 0),
+            warnings: [...results.flatMap((r) => r.warnings), ...staleWarnings],
+            events: eventSlugs,
+          };
+        },
+        { maxWait: 10_000, timeout: 30_000 },
+      );
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
         throw new RegistrationRetryableError('Concurrent submission for the same people; retry');
       }
       throw error;
     }
+  }
+
+  /**
+   * An edited response that no longer lists an event: drop that event's unverified
+   * registrations from this response. Verified/entered ones are kept with a warning.
+   */
+  private async removeDroppedEvents(tx: Prisma.TransactionClient, responseId: string, keep: string[]) {
+    const warnings: string[] = [];
+    const stale = await tx.team.findMany({
+      where: { responseId, eventSlug: { notIn: keep } },
+      include: { registrations: { include: { person: { select: { email: true } } } } },
+    });
+    for (const team of stale) {
+      for (const reg of team.registrations) {
+        if (isLocked(reg)) {
+          warnings.push(
+            `${reg.person.email} is no longer registered for ${this.config.eventName(team.eventSlug)} in the form but is already verified/entered; kept, fix manually`,
+          );
+          continue;
+        }
+        await tx.teamMember.deleteMany({ where: { teamId: team.id, personId: reg.personId } });
+        await tx.registration.delete({ where: { id: reg.id } });
+      }
+    }
+    return warnings;
+  }
+
+  /**
+   * Finds the person by email, or by a previous email (after a staff email change), so a
+   * resync of an old row never recreates the old address. Email itself is never overwritten.
+   */
+  private async resolvePerson(tx: Prisma.TransactionClient, member: ParsedMember) {
+    let collegeId: string | undefined;
+    if (member.college && collegeNameKey(member.college)) {
+      const college = await tx.college.upsert({
+        where: { nameKey: collegeNameKey(member.college) },
+        create: { nameKey: collegeNameKey(member.college), name: collegeDisplayName(member.college) },
+        update: {},
+      });
+      collegeId = college.id;
+    }
+    // undefined fields are left untouched on update, so a form without an upload
+    // does not erase a photo collected earlier.
+    const profile = {
+      name: member.name,
+      phone: member.phone,
+      college: member.college ? collegeDisplayName(member.college) : undefined,
+      collegeId,
+      rollNumber: member.rollNumber,
+      aadhaarLast4: member.aadhaarLast4,
+      // Full number only encrypted, and only when a key is configured.
+      aadhaarEncrypted: member.aadhaarFull && this.config.aadhaarKey ? encryptAadhaar(member.aadhaarFull, this.config.aadhaarKey) : undefined,
+      aadhaarDriveId: member.aadhaarDriveId,
+      photoDriveId: member.photoDriveId,
+      idDocumentDriveId: member.idDocumentDriveId,
+    };
+    const existing =
+      (await tx.person.findUnique({ where: { email: member.email } })) ??
+      (await tx.personEmailAlias.findUnique({ where: { email: member.email }, include: { person: true } }))?.person;
+    if (existing) return tx.person.update({ where: { id: existing.id }, data: profile });
+    return tx.person.create({ data: { email: member.email, ...profile } });
   }
 
   private async ingestInTx(
@@ -98,23 +188,12 @@ export class RegistrationsService {
 
     const people = [];
     for (const member of members) {
-      const profile = {
-        name: member.name,
-        phone: member.phone,
-        college: member.college,
-        photoDriveId: member.photoDriveId,
-        idDocumentDriveId: member.idDocumentDriveId,
-      };
-      // undefined fields are left untouched on update, so a form without an upload
-      // does not erase a photo collected earlier (e.g. by the profile-completion form).
-      const person = await tx.person.upsert({
-        where: { email: member.email },
-        create: { email: member.email, ...profile },
-        update: profile,
-      });
-      people.push({ member, person });
+      people.push({ member, person: await this.resolvePerson(tx, member) });
     }
     const personIds = people.map((p) => p.person.id);
+    if (new Set(personIds).size !== personIds.length) {
+      throw new RegistrationConflictError(['Two members of this response are the same participant (old and new email)']);
+    }
 
     const existingRegs = new Map(
       (
@@ -166,6 +245,7 @@ export class RegistrationsService {
       sourceSheet: source.sourceSheet,
       sourceRow: source.sourceRow,
       responseId,
+      ...submission.details,
     };
 
     const activity: ActivityEntry[] = [];
@@ -187,7 +267,13 @@ export class RegistrationsService {
         activity.push({
           registrationId: created.id,
           type: ActivityType.SUBMITTED,
-          details: { responseId, sourceRow: source.sourceRow ?? null, transactionId: transactionId ?? null },
+          details: {
+            responseId,
+            sourceRow: source.sourceRow ?? null,
+            transactionId: transactionId ?? null,
+            expectedArrival: submission.details.expectedArrivalText ?? null,
+            expectedDeparture: submission.details.expectedDepartureText ?? null,
+          },
         });
         continue;
       }
@@ -224,6 +310,14 @@ export class RegistrationsService {
           movedFromTeamId: reg.teamId !== team.id ? reg.teamId : null,
           transactionId: payment.transactionId !== undefined ? (transactionId ?? null) : undefined,
           paymentResetFromRejected: payment.paymentStatus === PaymentStatus.PENDING || undefined,
+          expectedArrival:
+            submission.details.expectedArrivalText !== undefined && submission.details.expectedArrivalText !== reg.expectedArrivalText
+              ? submission.details.expectedArrivalText
+              : undefined,
+          expectedDeparture:
+            submission.details.expectedDepartureText !== undefined && submission.details.expectedDepartureText !== reg.expectedDepartureText
+              ? submission.details.expectedDepartureText
+              : undefined,
         },
       });
     }

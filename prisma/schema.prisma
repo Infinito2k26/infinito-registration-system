@@ -18,9 +18,22 @@ enum RegistrationStatus {
   CANCELLED
 }
 
+/// Outcome of a gate scan: ENTERED = the action succeeded (check-in or check-out), REJECTED = refused.
 enum EntryStatus {
   ENTERED
   REJECTED
+}
+
+enum EntryKind {
+  CHECK_IN
+  CHECK_OUT
+}
+
+enum EmailBatchKind {
+  /// Every eligible student of a college gets their own QR at their own email.
+  COLLEGE_EACH
+  /// All eligible students' QR passes in one email to one selected student.
+  COLLEGE_TO_ONE
 }
 
 enum EmailStatus {
@@ -59,21 +72,42 @@ enum ActivityType {
   QR_EMAIL_RESENT
   ENTERED
   ENTRY_DENIED
+  EMAIL_CHANGED
+  QR_EMAIL_BULK_QUEUED
+  QR_PASSES_FORWARDED
+  CHECKED_OUT
+  CHECKOUT_DENIED
+  BLOCKED
+  UNBLOCKED
 }
 
 model Person {
-  id                String  @id @default(uuid()) @db.Uuid
+  id                String    @id @default(uuid()) @db.Uuid
   /// Stored lowercased and trimmed; one person = one QR across all events.
-  email             String  @unique
+  email             String    @unique
   name              String?
   phone             String?
+  /// College name as last submitted (display); grouping uses collegeId.
   college           String?
+  collegeId         String?   @db.Uuid
+  rollNumber        String?
+  /// Only the last 4 Aadhaar digits are stored; the full number never enters this database.
+  aadhaarLast4      String?
+  /// Full Aadhaar number, AES-256-GCM encrypted with AADHAAR_ENCRYPTION_KEY ("v1:iv:tag:data").
+  /// Decrypted only to render an ADMIN's page; never sent to coordinators/volunteers.
+  aadhaarEncrypted  String?
+  /// Aadhaar card image (Drive file ID). ADMIN only.
+  aadhaarDriveId    String?
+  /// Gate access block (whole participant, every event). History lives in RegistrationActivity.
+  blockedAt         DateTime?
+  blockedById       String?   @db.Uuid
+  blockReason       String?
   /// Google Drive file IDs. Files stay private; the server proxies them to logged-in volunteers.
   photoDriveId      String?
   idDocumentDriveId String?
   /// Random bearer token encoded in the QR URL (/p/<qrToken>). Created on the person's first verified
   /// payment; kept in plain form so passes can be re-sent.
-  qrToken           String? @unique
+  qrToken           String?   @unique
 
   /// Migration of past participants: token embedded in the pre-filled profile form link.
   profileToken          String?   @unique
@@ -88,12 +122,43 @@ model Person {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  teamMembers   TeamMember[]
-  registrations Registration[]
-  entryLogs     EntryLog[]
-  emailOutbox   EmailOutbox[]
+  teamMembers     TeamMember[]
+  registrations   Registration[]
+  entryLogs       EntryLog[]
+  emailOutbox     EmailOutbox[]
+  collegeRef      College?           @relation(fields: [collegeId], references: [id], onDelete: SetNull)
+  emailAliases    PersonEmailAlias[]
+  batchesReceived EmailBatch[]
+  blockedBy       StaffUser?         @relation("PersonBlockedBy", fields: [blockedById], references: [id], onDelete: SetNull)
 
   @@index([profileCompletedAt])
+  @@index([collegeId])
+  @@index([blockedAt])
+  @@index([phone])
+  @@index([rollNumber])
+}
+
+/// Colleges as submitted, grouped by a normalised key (lowercase, single spaces).
+model College {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  nameKey   String   @unique
+  createdAt DateTime @default(now())
+
+  people  Person[]
+  batches EmailBatch[]
+}
+
+/// Previous emails of a person (after a staff email change). Form resyncs that still carry
+/// the old email resolve to the same person instead of recreating it.
+model PersonEmailAlias {
+  email     String   @id
+  personId  String   @db.Uuid
+  createdAt DateTime @default(now())
+
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@index([personId])
 }
 
 model Team {
@@ -128,27 +193,41 @@ model TeamMember {
 }
 
 model Registration {
-  id                  String             @id @default(uuid()) @db.Uuid
-  eventSlug           String
-  personId            String             @db.Uuid
-  teamId              String?            @db.Uuid
-  transactionId       String?
-  paymentStatus       PaymentStatus      @default(PENDING)
-  status              RegistrationStatus @default(PENDING)
+  id                    String             @id @default(uuid()) @db.Uuid
+  eventSlug             String
+  personId              String             @db.Uuid
+  teamId                String?            @db.Uuid
+  transactionId         String?
+  paymentStatus         PaymentStatus      @default(PENDING)
+  status                RegistrationStatus @default(PENDING)
   /// Rejection reason shown to coordinators and sent to the captain.
-  paymentRemarks      String?
+  paymentRemarks        String?
   /// Last verify/reject decision. Full history lives in RegistrationActivity.
-  paymentReviewedById String?            @db.Uuid
-  paymentReviewedAt   DateTime?
-  sourceForm          String?
-  sourceSheet         String?
-  sourceRow           Int?
-  responseId          String?
+  paymentReviewedById   String?            @db.Uuid
+  paymentReviewedAt     DateTime?
+  sourceForm            String?
+  sourceSheet           String?
+  sourceRow             Int?
+  responseId            String?
   /// Gate entry. Set once with a conditional update (where enteredAt is null), so two simultaneous scans cannot both succeed.
-  enteredAt           DateTime?
-  enteredById         String?            @db.Uuid
-  createdAt           DateTime           @default(now())
-  updatedAt           DateTime           @updatedAt
+  enteredAt             DateTime?
+  enteredById           String?            @db.Uuid
+  /// Current presence: set on check-in, cleared on check-out (conditional updates, race-safe).
+  insideSince           DateTime?
+  lastCheckInAt         DateTime?
+  lastCheckOutAt        DateTime?
+  /// Form details (per event registration). Accommodation dates are not gate check-in/out.
+  accommodation         String?
+  accommodationPeriod   String?
+  /// Form "Check In Date" / "Check Out Date": the participant's PLANNED arrival/departure, as
+  /// submitted (text) and parsed (date). Never the actual gate time (see insideSince / EntryLog).
+  expectedArrivalText   String?
+  expectedDepartureText String?
+  expectedArrivalDate   DateTime?          @db.Date
+  expectedDepartureDate DateTime?          @db.Date
+  remark                String?
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
 
   person            Person                 @relation(fields: [personId], references: [id], onDelete: Cascade)
   team              Team?                  @relation(fields: [teamId], references: [id], onDelete: SetNull)
@@ -161,6 +240,9 @@ model Registration {
   /// One registration per person per event; re-ingesting the same response updates it.
   @@unique([eventSlug, personId])
   @@index([eventSlug, paymentStatus])
+  @@index([insideSince])
+  @@index([expectedArrivalDate])
+  @@index([expectedDepartureDate])
   @@index([transactionId])
   @@index([teamId])
 }
@@ -188,6 +270,7 @@ model EntryLog {
   registrationId String?     @db.Uuid
   eventSlug      String
   volunteerId    String?     @db.Uuid
+  kind           EntryKind   @default(CHECK_IN)
   status         EntryStatus @default(ENTERED)
   enteredAt      DateTime    @default(now())
   gate           String?
@@ -220,6 +303,8 @@ model StaffUser {
   reviewedRegistrations Registration[]         @relation("RegistrationReviewedBy")
   activities            RegistrationActivity[]
   triggeredEmails       EmailOutbox[]
+  emailBatches          EmailBatch[]
+  blockedPeople         Person[]               @relation("PersonBlockedBy")
 }
 
 /// One row per signed-in device, so staff can be signed in on several phones.
@@ -244,6 +329,8 @@ model EmailOutbox {
   registrationId    String?              @db.Uuid
   /// Staff member whose action queued this email (verify, resend); null for automatic emails.
   triggeredById     String?              @db.Uuid
+  /// Bulk college send this email belongs to.
+  batchId           String?              @db.Uuid
   toEmail           String
   /// e.g. "qr-pass:<registrationId>:initial". Enqueueing the same key twice is a no-op; also sent to Resend as its Idempotency-Key.
   idempotencyKey    String               @unique
@@ -265,7 +352,32 @@ model EmailOutbox {
   person       Person?       @relation(fields: [personId], references: [id], onDelete: SetNull)
   registration Registration? @relation(fields: [registrationId], references: [id], onDelete: SetNull)
   triggeredBy  StaffUser?    @relation(fields: [triggeredById], references: [id], onDelete: SetNull)
+  batch        EmailBatch?   @relation(fields: [batchId], references: [id], onDelete: SetNull)
 
   @@index([status, sendAt])
+  @@index([batchId])
   @@index([registrationId, template])
+}
+
+/// Audit record of a bulk college QR send; per-email progress comes from its EmailOutbox rows.
+model EmailBatch {
+  id                String         @id @default(uuid()) @db.Uuid
+  kind              EmailBatchKind
+  collegeId         String         @db.Uuid
+  /// Null = all events of the college.
+  eventSlug         String?
+  /// COLLEGE_TO_ONE: the selected student and the address used at the time.
+  recipientPersonId String?        @db.Uuid
+  recipientEmail    String?
+  triggeredById     String?        @db.Uuid
+  eligibleCount     Int
+  queuedCount       Int
+  createdAt         DateTime       @default(now())
+
+  college         College       @relation(fields: [collegeId], references: [id], onDelete: Cascade)
+  recipientPerson Person?       @relation(fields: [recipientPersonId], references: [id], onDelete: SetNull)
+  triggeredBy     StaffUser?    @relation(fields: [triggeredById], references: [id], onDelete: SetNull)
+  emails          EmailOutbox[]
+
+  @@index([collegeId, createdAt])
 }

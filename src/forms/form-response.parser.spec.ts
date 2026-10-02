@@ -1,11 +1,14 @@
 import { DEFAULT_FORM_FIELD_MAP, FormFieldMap } from './form-field-map';
 import {
   extractDriveFileIds,
+  aadhaarLast4,
   normalizePhone,
+  parseExpectedDate,
   parseFormResponse,
 } from './form-response.parser';
 
-const map: FormFieldMap = DEFAULT_FORM_FIELD_MAP;
+// Most tests below exercise other fields, so they don't repeat a Sports answer.
+const map: FormFieldMap = { ...DEFAULT_FORM_FIELD_MAP, requireSports: false };
 
 describe('parseFormResponse', () => {
   it('parses a team, normalising emails, phones, txn and Drive links', () => {
@@ -94,7 +97,7 @@ describe('parseFormResponse', () => {
         'Member 4 Name': 'D',
         'Member 4 Email': 'B@example.com',
       },
-      map,
+      { ...map, requireTransactionId: true },
     );
     expect(result).toEqual({
       ok: false,
@@ -131,6 +134,155 @@ describe('parseFormResponse', () => {
     expect(result.ok && result.warnings).toEqual([
       'Member 1: phone "12345" looks invalid',
     ]);
+  });
+});
+
+describe('the actual individual registration form', () => {
+  const row = {
+    Timestamp: '2026-10-03T09:00:00.000Z',
+    'Email Address *': ' Priya.S@Example.com ',
+    'College Name': '  NIT   Patna ',
+    'Sports:': 'Table Tennis',
+    'Name ': 'Priya Sharma',
+    'Mobile No.': '+91 98765 43210',
+    'College Roll No.': ' 2201CS42 ',
+    'College ID Card Photo': 'https://drive.google.com/open?id=1CollegeIdCardFileIdAAAAA',
+    'Aadhaar No.': '1234 5678 9012',
+    'Aadhaar Card Photo': 'https://drive.google.com/open?id=1AadhaarCardFileIdBBBBBB',
+    'Check In Date': '10/10/2026',
+    'Check Out Date': '12/10/2026',
+    Accommodation: 'Yes',
+    'Accommodation Period': '2 nights',
+    Remark: 'Vegetarian',
+  };
+
+  it('maps every column, keeps only the last 4 Aadhaar digits and derives the event from Sports', () => {
+    const result = parseFormResponse(row, map);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.warnings).toEqual([]);
+    expect(result.value.eventSlugs).toEqual(['table-tennis']);
+    expect(result.value.transactionId).toBeUndefined();
+    expect(result.value.members).toEqual([
+      {
+        position: 1,
+        isCaptain: true,
+        name: 'Priya Sharma',
+        email: 'priya.s@example.com',
+        phone: '9876543210',
+        college: 'NIT   Patna', // trimmed here; spaces are collapsed when the college is resolved
+        photoDriveId: undefined,
+        idDocumentDriveId: '1CollegeIdCardFileIdAAAAA',
+        rollNumber: '2201CS42',
+        aadhaarLast4: '9012',
+        aadhaarFull: '123456789012', // in memory only; stored encrypted
+        aadhaarDriveId: '1AadhaarCardFileIdBBBBBB',
+      },
+    ]);
+    expect(aadhaarLast4('1234 5678').full).toBeUndefined(); // only a valid 12-digit number is kept
+    expect(result.value.details).toEqual({
+      accommodation: 'Yes',
+      accommodationPeriod: '2 nights',
+      expectedArrivalText: '10/10/2026',
+      expectedDepartureText: '12/10/2026',
+      expectedArrivalDate: new Date('2026-10-10T00:00:00.000Z'),
+      expectedDepartureDate: new Date('2026-10-12T00:00:00.000Z'),
+      remark: 'Vegetarian',
+    });
+  });
+
+  it.each(['Email', 'Email ID', 'Email Address', 'Email Address *', 'Email Address:', 'EMAIL  ID.'])(
+    'recognises the email column titled %j',
+    (title) => {
+      const result = parseFormResponse({ Name: 'A', [title]: 'a@example.com' }, map);
+      expect(result.ok && result.value.members[0].email).toBe('a@example.com');
+    },
+  );
+
+  it('splits several sports into one event each, and leaves events empty without a Sports answer', () => {
+    const multi = parseFormResponse({ ...row, 'Sports:': 'Football, Table Tennis' }, map);
+    expect(multi.ok && multi.value.eventSlugs).toEqual(['football', 'table-tennis']);
+    const none = parseFormResponse({ Name: 'A', Email: 'a@example.com' }, map);
+    expect(none.ok && none.value.eventSlugs).toEqual([]);
+  });
+
+  it('warns about a malformed Aadhaar number but still imports', () => {
+    const result = parseFormResponse({ ...row, 'Aadhaar No.': '12345' }, map);
+    expect(result.ok && result.warnings).toEqual(['Member 1: Aadhaar number should have 12 digits']);
+  });
+});
+
+describe('expected (planned) dates', () => {
+  it.each([
+    ['2026-10-05', '2026-10-05'],
+    ['05/10/2026', '2026-10-05'], // day first (India)
+    ['5/10/2026', '2026-10-05'],
+    ['5-10-2026', '2026-10-05'],
+    ['5.10.26', '2026-10-05'],
+    ['2026-10-04T18:30:00.000Z', '2026-10-05'], // a date cell exported as UTC midnight IST
+    ['5 October 2026', '2026-10-05'],
+    ['05 Oct 2026', '2026-10-05'],
+    ['October 5, 2026', '2026-10-05'],
+    ['5th Oct, 2026', '2026-10-05'],
+    ['31/02/2026', undefined],
+    ['next week', undefined],
+    ['', undefined],
+  ])('parseExpectedDate(%j) = %j', (input, expected) => {
+    expect(parseExpectedDate(input)).toBe(expected);
+  });
+
+  it('keeps an unreadable date as text with a warning, never rejecting the row', () => {
+    const result = parseFormResponse({ Name: 'A', Email: 'a@example.com', 'Check In Date': 'around Diwali' }, map);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.details.expectedArrivalText).toBe('around Diwali');
+    expect(result.value.details.expectedArrivalDate).toBeUndefined();
+    expect(result.warnings).toEqual(['Check In Date (expected arrival) "around Diwali" is not a recognised date; kept as text']);
+  });
+
+  it('missing dates are fine', () => {
+    const result = parseFormResponse({ Name: 'A', Email: 'a@example.com' }, map);
+    expect(result.ok && result.value.details).toEqual({});
+  });
+});
+
+describe('Sports decides the event', () => {
+  const base = { Name: 'Priya', Email: 'priya@example.com' };
+
+  it.each([
+    ['Football', ['football']],
+    ['Table Tennis', ['table-tennis']],
+    ['  BADMINTON ', ['badminton']],
+    ['Football, Table Tennis', ['football', 'table-tennis']],
+  ])('Sports %j -> %j', (sports, slugs) => {
+    const result = parseFormResponse({ ...base, Sports: sports }, DEFAULT_FORM_FIELD_MAP);
+    expect(result.ok && result.value.eventSlugs).toEqual(slugs);
+  });
+
+  it('TT -> tt, hoki -> hoki', () => {
+    for (const [sports, slug] of [['TT', 'tt'], ['hoki', 'hoki']]) {
+      const result = parseFormResponse({ ...base, Sports: sports }, DEFAULT_FORM_FIELD_MAP);
+      expect(result.ok && result.value.eventSlugs).toEqual([slug]);
+    }
+  });
+
+  it('an explicit (even empty) Sports answer wins over Sport/Event/Game columns', () => {
+    const both = parseFormResponse({ ...base, Sports: 'TT', Event: 'Hockey' }, DEFAULT_FORM_FIELD_MAP);
+    expect(both.ok && both.value.eventSlugs).toEqual(['tt']);
+    expect(parseFormResponse({ ...base, Sports: '', Event: 'Hockey' }, DEFAULT_FORM_FIELD_MAP)).toEqual({
+      ok: false,
+      errors: ['Sports is missing: the sport/event must be chosen in the form'],
+    });
+    const eventOnly = parseFormResponse({ ...base, Event: 'Hockey' }, DEFAULT_FORM_FIELD_MAP);
+    expect(eventOnly.ok && eventOnly.value.eventSlugs).toEqual(['hockey']);
+  });
+
+  it('rejects a row without a Sports answer (there is no fallback event)', () => {
+    expect(parseFormResponse(base, DEFAULT_FORM_FIELD_MAP)).toEqual({
+      ok: false,
+      errors: ['Sports is missing: the sport/event must be chosen in the form'],
+    });
+    expect(parseFormResponse({ ...base, Sports: '   ' }, DEFAULT_FORM_FIELD_MAP).ok).toBe(false);
   });
 });
 

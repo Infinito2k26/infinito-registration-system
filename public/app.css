@@ -82,6 +82,10 @@ button.danger { border-color: var(--bad); color: var(--bad); }
 button.small { padding: 4px 10px; font-size: 0.85rem; }
 button.link { border: 0; background: none; color: var(--accent); padding: 0; }
 .big { font-size: 1.1rem; padding: 14px 20px; width: 100%; }
+button.exit {
+  background: var(--surface); border: 2px solid var(--warn); color: var(--warn); font-weight: 800;
+  font-size: 1.2rem; letter-spacing: 0.04em; padding: 18px;
+}
 button.enter {
   background: var(--ok); border-color: var(--ok); color: #fff; font-weight: 800;
   font-size: 1.4rem; letter-spacing: 0.04em; padding: 22px;
@@ -143,9 +147,9 @@ form.inline { display: inline; }
 
 .title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .title-row h1 { margin: 0; }
-.facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0 0 12px; }
+.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; margin: 0 0 12px; }
 .facts dt { color: var(--muted); }
-.facts dd { margin: 0; }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
 .reject { max-width: 560px; margin-top: 16px; }
 
@@ -166,3 +170,25 @@ form.inline { display: inline; }
 .verdict h1 { font-size: 1.6rem; }
 .verdict-bad { background: var(--bad-bg); color: var(--bad); }
 .verdict-warn { background: var(--warn-bg); color: var(--warn); }
+
+/* Dashboard counters & college */
+.counters { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin: 0 0 16px; }
+.counter { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
+.counter .label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.counter .value { font-size: 1.5rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.counter.ok .value { color: var(--ok); }
+.counter.warn .value { color: var(--warn); }
+.counter.info .value { color: var(--info); }
+.bulk { display: grid; gap: 16px; grid-template-columns: 1fr; }
+@media (min-width: 900px) { .bulk { grid-template-columns: 1fr 1fr; } }
+.bulk h3 { margin: 0 0 6px; font-size: 1rem; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Clickable rows and counter tiles used as filters */
+.rows-clickable tbody tr[data-href] { cursor: pointer; }
+.rows-clickable tbody tr[data-href]:hover { background: var(--bg); }
+a.counter { text-decoration: none; color: inherit; display: block; }
+a.counter:hover { border-color: var(--accent); }
+a.counter.active { border: 2px solid var(--accent); box-shadow: 0 0 0 2px var(--info-bg); }
+.registration.highlight { border: 2px solid var(--accent); }
+

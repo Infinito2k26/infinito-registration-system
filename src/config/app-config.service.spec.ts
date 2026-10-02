@@ -38,8 +38,19 @@ describe('AppConfig', () => {
     expect(config({ RESEND_API_KEY: 're_x', MAIL_FROM: 'Infinito <no-reply@infinito2k26.com>' }).emailConfigProblems()).toEqual([]);
   });
 
+  it('derives event display names from the slug (short words uppercased)', () => {
+    const c = config({});
+    expect(['tt', 'hoki', 'table-tennis', 'e-sports-bgmi'].map((slug) => c.eventName(slug))).toEqual([
+      'TT',
+      'Hoki',
+      'Table Tennis',
+      'E Sports Bgmi',
+    ]);
+    expect(config({ EVENT_NAMES: '{"hoki":"Hockey"}' }).eventName('hoki')).toBe('Hockey');
+  });
+
   it('reads the resend limit and delay from env with defaults', () => {
-    expect(config({}).qrManualResendLimit).toBe(3);
+    expect(config({}).qrManualResendLimit).toBe(0); // 0 = unlimited
     expect(config({ QR_MANUAL_RESEND_LIMIT: '5' }).qrManualResendLimit).toBe(5);
     expect(config({}).decisionEmailDelaySeconds).toBe(120);
   });

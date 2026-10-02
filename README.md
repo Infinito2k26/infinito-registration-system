@@ -1,402 +1,751 @@
 # Infinito Registration System
 
-Registration import, payment verification, QR entry passes and gate entry for **Infinito 2K26**.
+Registration import, manual verification, QR entry passes, college-level email operations and gate
+check-in/check-out for **Infinito 2K26**.
 
-## 1. Overview
+Participants fill a Google Form. Each response row is synced into PostgreSQL, which is the source of
+truth from then on. Coordinators verify participants and send passes from a web dashboard, and
+volunteers scan passes at the gate. The Google Sheet is only the import layer: nothing is decided in
+it, and nothing is read back from it.
 
-Participants register through Google Forms, one form per sport/event. Each response is synced
-into PostgreSQL, and from then on the database is the source of truth. Staff work in a small,
-server-rendered web app:
+**Key concepts (never mixed):**
 
-| Who | Where | What |
+| Term | Meaning | Source |
 |---|---|---|
-| Coordinators / admins | `/admin/registrations` | Event-wise lists, search, verify/reject payments, QR email status and resends, history |
-| Volunteers (and any staff) | `/scan` → `/p/<token>` | Scan a pass, check photo/name/college/team/event, MARK ENTERED |
-| Admins | `/admin/staff` | Add staff, set roles, disable accounts |
+| **Expected arrival date** | The participant's planned or approximate arrival | Form question "Check In Date" |
+| **Expected departure date** | The participant's planned or approximate departure | Form question "Check Out Date" |
+| **Actual check-in (IN)** | The moment the participant's QR was scanned in at the gate | Server clock at **MARK ENTERED / CHECK IN** |
+| **Actual check-out (OUT)** | The moment the participant's QR was scanned out at the gate | Server clock at **CHECK OUT** |
+| **Blocked** | The participant's QR is refused for every IN and OUT until unblocked | Coordinator/admin action |
 
-Google Sheets is **only the import layer**. Payments are never verified in the sheet.
+---
 
-## 2. Architecture
+## 1. Architecture
 
 ```
-Google Form ─► response Sheet ─► Apps Script (onFormSubmit / resync)
-                                     │  POST /webhooks/forms/submit  (X-Webhook-Secret)
-                                     ▼
-                           NestJS app ──► PostgreSQL (Prisma)
-                             │   ▲             │
-     staff (magic link) ─────┘   │             ├─► EmailOutbox ─► worker ─► Resend ─► participant
-                                 │             │                          ◄─ /webhooks/resend (delivery)
-     participant QR ─► /p/<token> (gate)       └─► Google Drive (photos / IDs, via service account)
+Google Form ─► Response Sheet ─► Apps Script (form-submit trigger / resync menu)
+                                   │ POST /webhooks/forms/submit   (X-Webhook-Secret)
+                                   ▼
+                         NestJS app ──► PostgreSQL (Prisma)  ◄── source of truth
+                           │   ▲            │
+   staff (magic link) ─────┘   │            ├─► EmailOutbox ─► worker ─► Resend ─► participant
+                               │            │                        ◄─ /webhooks/resend (delivery)
+   participant QR ─► /p/<token> (gate)      └─► Google Drive (photos / ID / Aadhaar, via service account)
 ```
 
 - **Stack:** Node.js 22+, NestJS 11, TypeScript, Prisma 7 (`@prisma/adapter-pg`), PostgreSQL,
-  Resend, `qrcode`, `jsqr`. There is no separate frontend: HTML is rendered on the server with
-  escaped templates, and the only JavaScript is two small files in `public/`.
-- **Modules:** `forms` (webhook + parser), `registrations` (ingest), `payments`, `emails`
-  (outbox, worker, Resend, webhook), `auth` (magic links, sessions, roles, staff), `admin`
-  (dashboard), `entry` (scan/gate), `drive` (photo proxy), `web` (HTML helpers).
+  Resend, `qrcode`, `jsqr`. Pages are rendered on the server with auto-escaping templates, and the
+  only JavaScript is two small files in `public/`.
+- **Modules:**
+  - `forms`: webhook and parser
+  - `registrations`: ingest, colleges, email change
+  - `payments`: verify, reject, undo
+  - `emails`: outbox, worker, Resend, college bulk sends
+  - `entry`: gate check-in/out
+  - `admin`: dashboard
+  - `auth`: magic links, sessions, roles, staff
+  - `drive`: file proxy
+  - `web`: HTML helpers
 - **Data model:**
-  - `Person`: one per email, holds the QR token.
-  - `Team`: one per form response; a solo entry is a team of one.
-  - `TeamMember`
-  - `Registration`: one per person per event, holds payment status and entry.
-  - `RegistrationActivity`: the audit history.
-  - `EmailOutbox`
-  - `EntryLog`: every scan outcome.
-  - `StaffUser` and `StaffSession`.
 
-## 3. Prerequisites
+| Table | Holds |
+|---|---|
+| `Person` | One per email: name, mobile, roll no., college, Aadhaar **last 4 digits** only, Drive file IDs, QR token, gate block (`blockedAt`, `blockedById`, `blockReason`) |
+| `College` | Colleges grouped by a normalised name (case and spacing ignored) |
+| `PersonEmailAlias` | Previous emails after a staff email change |
+| `Team` + `TeamMember` | One per form response (individual forms = a team of one) |
+| `Registration` | One per participant per event: verification status, planned dates (`expectedArrival/DepartureText` + parsed `…Date`), accommodation/remark, actual gate presence (`insideSince`, `lastCheckInAt`, `lastCheckOutAt`) |
+| `RegistrationActivity` | Audit history |
+| `EmailOutbox` | Every email, with status and delivery |
+| `EmailBatch` | Audit record of each college bulk send |
+| `EntryLog` | Every check-in/check-out attempt, successful or refused |
+| `StaffUser` / `StaffSession` | Staff accounts and signed-in devices |
+
+## 2. Prerequisites
 
 - Node.js 22.12 or newer, and npm
-- Docker (for local PostgreSQL), or any PostgreSQL 14+
-- For real email: a Resend account with a verified sending domain
-- For photos and IDs: a Google Cloud service account (optional)
+- Docker (for local PostgreSQL), or PostgreSQL 14+
+- A Resend account with a verified sending domain (for real email)
+- A Google Cloud service account (optional; needed to show photos, IDs and Aadhaar images)
 
-## 4. Installation
+## 3. Installation
 
 ```bash
 npm install          # also runs `prisma generate`
 cp .env.example .env
 ```
 
-## 5. Environment variables
+## 4. `.env`
 
-All configuration comes from environment variables. [.env.example](.env.example) documents every
-one with its default. Key ones:
+Every variable is documented in [.env.example](.env.example). The main ones:
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `DATABASE_URL` | yes | PostgreSQL connection string |
-| `APP_BASE_URL` | yes | Public URL. Every QR and sign-in link is built from it. **https in production** |
-| `APP_SECRET` | prod | Signs CSRF tokens (≥ 32 chars) |
-| `FORMS_WEBHOOK_SECRET` | yes | Shared with the Apps Script (≥ 24 random chars in production) |
-| `BOOTSTRAP_ADMIN_EMAILS` | first run | Comma-separated emails made active admins on every start |
-| `RESEND_API_KEY`, `MAIL_FROM`, `MAIL_REPLY_TO` | prod | Email sending (see §17) |
-| `RESEND_WEBHOOK_SECRET` | optional | Delivery/bounce tracking |
-| `EMAIL_TEST_RECIPIENT` | dev only | Redirect every email to one inbox; ignored in production |
-| `EMAIL_WORKER_ENABLED` | | `false` on every instance except one per database |
-| `DECISION_EMAIL_DELAY_SECONDS` | | Undo window before QR/rejection emails send (default 120) |
-| `QR_MANUAL_RESEND_LIMIT` | | Manual QR resends per participant per event (default 3) |
-| `QR_TOKEN_BYTES` | | QR token randomness (default 32, minimum 16) |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | optional | Drive access for photos/IDs (see §23) |
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection |
+| `APP_BASE_URL` | Public URL. QR and sign-in links are built from it (https in production) |
+| `APP_SECRET` | Signs CSRF tokens (≥ 32 characters in production) |
+| `FORMS_WEBHOOK_SECRET` | Shared with the Apps Script (≥ 24 random characters in production) |
+| `BOOTSTRAP_ADMIN_EMAILS` | Comma-separated; made active admins on every start |
+| `RESEND_API_KEY`, `MAIL_FROM`, `MAIL_REPLY_TO`, `RESEND_WEBHOOK_SECRET` | Email (§34) |
+| `EMAIL_TEST_RECIPIENT` | Development only: deliver every email to one inbox |
+| `EMAIL_WORKER_ENABLED` | Set `false` on all but one instance per database |
+| `DECISION_EMAIL_DELAY_SECONDS` | Undo window before QR/rejection emails send (default 120) |
+| `QR_MANUAL_RESEND_LIMIT` | Manual QR sends per participant per event; **0 = unlimited (default)** |
+| `QR_TOKEN_BYTES` | QR token randomness (default 32) |
+| `EVENT_NAMES` | Optional display names per slug |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Drive access (§35) |
+| `AADHAAR_ENCRYPTION_KEY` | Stores full Aadhaar numbers **encrypted** (AES-256-GCM) for admins; empty = last 4 digits only |
+| `VOLUNTEERS_CAN_VERIFY` | `true` lets volunteers verify from the gate card (default `false`) |
 
-**Development vs production.** With `NODE_ENV=production` the app **refuses to start** if any of
-these is true:
-- `APP_SECRET` is shorter than 32 characters.
-- `FORMS_WEBHOOK_SECRET` is shorter than 24 characters, or is still `change-this-secret`.
-- `APP_BASE_URL` is not `https://`.
-- `RESEND_API_KEY` is missing.
-
-Production also ignores `EMAIL_TEST_RECIPIENT`. In development, a missing Resend key means emails
-are printed to the server log instead of sent.
-
-## 6. PostgreSQL (Docker)
+## 5. PostgreSQL
 
 ```bash
-docker compose up -d      # postgres:16 on localhost:5433, db infinito_dev
+docker compose up -d      # postgres:16 on localhost:5433, database infinito_dev
 ```
 
-## 7. Prisma setup
+## 6. Prisma
 
-The Prisma CLI reads `DATABASE_URL` through [prisma.config.ts](prisma.config.ts). `npm install`
-already generates the client; run `npx prisma generate` after changing `prisma/schema.prisma`.
-
-## 8. Migrations
+The schema is in `prisma/schema.prisma`, and the CLI reads `DATABASE_URL` through
+`prisma.config.ts`.
 
 ```bash
-npx prisma migrate deploy     # apply all migrations (local, CI, production)
+npx prisma migrate deploy   # apply migrations (local, CI and production)
 npx prisma migrate status
+npx prisma validate
 npx prisma migrate dev --name <change>   # only when you change the schema
 ```
 
-The three migrations in `prisma/migrations` apply cleanly to an empty database.
+Five migrations apply cleanly to an empty database. The last two preserve existing data:
+- **`20261003090000_college_inout_email_ops`:** creates colleges from existing participants and
+  marks anyone who had already entered as inside.
+- **`20261004090000_expected_dates_and_block`:**
+  - It *renames* the form date columns to `expectedArrivalText` and `expectedDepartureText`; no
+    data is lost.
+  - It adds parsed `expectedArrivalDate` and `expectedDepartureDate`, backfilled from the existing
+    text. Unreadable values are left for the next resync.
+  - It adds the participant block fields.
 
-## 9. Seed / bootstrap admin
+## 7. Seed / bootstrap admin
 
-Set `BOOTSTRAP_ADMIN_EMAILS=you@example.com`. The app makes those addresses active admins on every
-start. To do it without starting the app, run:
+Set `BOOTSTRAP_ADMIN_EMAILS=you@example.com` and start the app. You can also run
+`npx prisma db seed`. Either way it is idempotent and never deletes or downgrades anyone.
 
-```bash
-npx prisma db seed            # idempotent; never deletes or downgrades anyone
-```
-
-## 10. Running locally
-
-```bash
-npm run start:dev                         # http://localhost:3000, health: GET /health
-```
-
-Open `/login`, enter your bootstrap admin email, and click the link. Without a Resend key, copy the
-link from the server log.
-
-| Command | What |
-|---|---|
-| `npm test` | Unit tests |
-| `npm run test:e2e` | End-to-end tests (real app + PostgreSQL). Needs `E2E_DATABASE_URL`, see §10a |
-| `npm run check-types` / `npm run lint` | TypeScript / ESLint |
-| `npm run build` then `npm run start:prod` | Production build and start (`node dist/src/main`) |
-| `npm run email:test -- you@example.com` | Send one real sample QR email with the current `.env` |
-
-**10a. E2E database.** The e2e suite truncates every table, so it only runs against a database
-whose name contains `e2e` or `test`. Migrations are applied to it automatically.
+## 8. Local run
 
 ```bash
-docker exec infinito_registration_postgres psql -U postgres -c "create database infinito_e2e"
-E2E_DATABASE_URL="postgresql://postgres:infinito_dev_pwd@localhost:5433/infinito_e2e" npm run test:e2e
+npm run start:dev       # http://localhost:3000   (health: GET /health)
 ```
 
-When `NODE_ENV=test`, the app ignores `.env`, so tests never pick up real credentials.
+Without `RESEND_API_KEY`, emails are printed to the server log instead of sent, which is useful for
+sign-in links during development.
 
-## 11. Google Form setup
+## 9. Google Form setup
 
-Use the agreed question titles. Matching ignores letter case, extra spaces, a trailing `*` and a
-trailing `:`. The aliases live in [src/forms/form-field-map.ts](src/forms/form-field-map.ts):
+Every form must have a **Sports** question: it is the **only** source of the event (§15). One
+form can serve one sport or many. The current form has these fields:
+Email, College Name, Sports, Name, Mobile No., College Roll No., College ID Card Photo, Aadhaar No.,
+Aadhaar Card Photo, Check In Date, Check Out Date, Accommodation, Accommodation Period and Remark.
+No payment question is needed.
 
-| Field | Accepted titles (examples) |
-|---|---|
-| Team name | `Team Name` (optional; defaults to the captain's name) |
-| Transaction ID | `Transaction ID`, `UPI Transaction ID`, `UTR Number`, `UTR` |
-| Member *n* | `Member {n} Name`, `Member {n} Email`, `Member {n} Phone`, `Member {n} College`, `Member {n} Photo`, `Member {n} ID` |
-| Member 1 fallbacks | `Captain Name`, `Name`, `Email`, `Phone`, `College ID`… plus the form's collected email |
-| College (whole team) | `College`, `College Name`, `Institute` |
+Uploads must be Google Forms file-upload questions.
 
-Per-event differences, such as team size or a free event with no transaction ID, go in
-`EVENT_FORM_FIELD_OVERRIDES` in the same file. Uploads (photo/ID) must be Google Forms
-file-upload questions.
+**Aadhaar:**
+- The **last 4 digits** are always stored.
+- The **full number** is stored only if `AADHAAR_ENCRYPTION_KEY` is set, and then only encrypted
+  (AES-256-GCM).
+- The full number is decrypted solely to render an **admin's** page.
+- Coordinators and volunteers only ever receive `XXXX XXXX 1234` from the server.
+- The Aadhaar card image is **admin-only**: `/staff/files/<id>/aadhaar` returns 403 for anyone
+  else, even with a copied link.
+- Participants imported before the key was set get their full number on the next resync, because
+  the Sheet still holds it.
+- Losing the key makes the stored numbers unreadable.
 
-Normalisation:
-- Emails are lowercased.
-- Indian phone numbers are reduced to 10 digits.
-- Transaction IDs are uppercased with spaces removed (`utr 111` = `UTR111`).
-- Drive links are reduced to file IDs.
+## 10. Google Sheet setup
 
-Invalid rows are rejected, and every problem is listed in the sheet.
+Link the form to a response spreadsheet (Responses → Link to Sheets). Don't sort the sheet or delete
+rows, and don't edit the `Response ID` column; protecting that column is recommended. The Sheet is
+**import-only**: verification, email changes, QR passes, resends and IN/OUT live in the database and
+are never written back to the Sheet.
 
-## 12. Google Sheet setup
-
-Link each form to its own response spreadsheet (Responses → Link to Sheets). Don't sort the sheet
-or delete rows, and don't edit the `Response ID` column. Protecting that column is a good idea.
-
-## 13. Apps Script setup
+## 11. Apps Script
 
 In the response spreadsheet, open Extensions → Apps Script, paste
 [apps-script/registration-form.gs](apps-script/registration-form.gs), set the Script Properties
-(§14), then run `setup` once and approve the permissions. `setup`:
+(§12), then run `setup` once and approve the permissions. `setup`:
 - adds the helper columns **Status** and **Response ID** to the right of the form columns
-- installs the form-submit trigger, so new submissions sync automatically
+- installs the form-submit trigger, so new rows sync automatically
 - adds an **Infinito** menu with *Resync unsent rows* and *Resync selected rows*
 
-## 14. Script Properties
+## 12. Script Properties
 
 | Property | Value |
 |---|---|
-| `WEBHOOK_URL` | `https://<your-server>/webhooks/forms/submit` (the base URL alone also works) |
-| `WEBHOOK_SECRET` | exactly the server's `FORMS_WEBHOOK_SECRET` |
-| `EVENT_SLUG` | the event's slug, e.g. `table-tennis` |
+| `WEBHOOK_URL` | see §13 |
+| `WEBHOOK_SECRET` | see §14 |
 
-## 15. EVENT_SLUG
+There is **no `EVENT_SLUG`** any more. An old `EVENT_SLUG` property is simply ignored, and you can
+delete it.
 
-The slug decides which event a sheet's registrations belong to, and the dashboard groups by it.
-It is lowercased; allowed characters are `a-z`, `0-9` and single hyphens. The display name comes
-from the slug (`table-tennis` → "Table Tennis") unless `EVENT_NAMES` overrides it. **Choose the
-slug before syncing and don't change it afterwards**: rows resynced under a new slug become new
-registrations for a different event.
+## 13. WEBHOOK_URL
 
-## 16. Existing-row resync
+`https://<your-server>/webhooks/forms/submit`. The base URL alone also works; the script adds the
+path. If it's wrong, rows show `⚠ Not synced (HTTP 404: check the WEBHOOK_URL …)`.
 
-Rows submitted before `setup`, or rows that failed with `⚠ Not synced` (server down, wrong URL),
-are picked up by **Infinito → Resync unsent rows**. Rows marked `❌` have bad data: fix the cells,
-select the rows, then use **Resync selected rows**.
+## 14. WEBHOOK_SECRET
 
-Resync is idempotent. Each row's **Response ID** (stamped on first sync) maps to one team, so
-resending a row, or a respondent editing their response, updates it instead of duplicating it.
+Exactly the server's `FORMS_WEBHOOK_SECRET`. A mismatch shows `❌ Webhook secret mismatch`.
 
-What the **Status** column shows:
-- `✅ Received · N member(s)`, plus warnings such as a reused transaction ID
-- `❌ <reasons>` for validation problems or conflicts
-- `⚠ Not synced (...)` for transient or configuration problems
+## 15. Event = the Sports answer
 
-## 17. Resend setup
+The event of each row comes **only** from its **Sports** answer, slugified:
 
-1. Verify your sending domain in Resend and create an API key.
-2. Set the following:
-   - `RESEND_API_KEY`
-   - `MAIL_FROM="Infinito 2K26 <no-reply@your-domain>"`
-   - `MAIL_REPLY_TO` (a monitored inbox)
-3. Check the setup with `npm run email:test -- you@example.com`.
-4. Optional delivery tracking:
-   - In Resend → Webhooks, add `<APP_BASE_URL>/webhooks/resend` with the events `email.delivered`,
-     `email.delivery_delayed`, `email.bounced`, `email.complained`, `email.failed` and
-     `email.suppressed`.
-   - Set `RESEND_WEBHOOK_SECRET` to the `whsec_…` signing secret.
-   - Bounces and spam complaints then show on the team page.
+| Sports answer | Event |
+|---|---|
+| Football | `football` |
+| Table Tennis | `table-tennis` |
+| Badminton | `badminton` |
+| Football, Table Tennis | `football` **and** `table-tennis` (one registration each) |
 
-For development without a domain, use `MAIL_FROM="Infinito Dev <onboarding@resend.dev>"` with
-`EMAIL_TEST_RECIPIENT=<your Resend account email>`. Switching to the official account later only
-changes these variables.
+- **How the script finds the column.** It locates the sport column by its header: **Sports**,
+  **Sport**, **Event** or **Game**, ignoring case, spaces, invisible characters and a trailing
+  `*`/`:`. Failing that, it uses a header starting with "Sport", e.g. "Sports (TT, Hockey)".
+- **What it sends.** The value always goes to the server as `answers.Sports`; e.g. `TT` → `tt`,
+  `hoki` → `hoki`. Each sync logs `Infinito sync row N: Sports column "…", answers.Sports = "…"`
+  (Apps Script → Executions). The server temporarily logs the received `answers.Sports` and column
+  titles.
+- **No Sports answer, no import.** A row without a Sports answer is **rejected**, with
+  `❌ Sports is missing: the sport/event must be chosen in the form` in Status. There is no
+  fallback event.
+- **One person, many sports.** The same email is always the same Person with the same QR. Each
+  sport gets its own registration, whether chosen in one row or in separate submissions.
+- **Display names** come from the slug (`table-tennis` → "Table Tennis") unless `EVENT_NAMES`
+  overrides them.
+- **Keep the options stable.** Renaming a Sports option after syncing creates registrations under
+  the new name; use a dropdown or multiple-choice question.
+- **Per-event field overrides** (`EVENT_FORM_FIELD_OVERRIDES`) are keyed by this slug.
 
-**How the worker behaves:**
-- **One queue.** Every email goes through `EmailOutbox` with a unique idempotency key, which is
-  also sent to Resend, so retries, double clicks and crashes never duplicate an email.
-- **Concurrency.** The worker claims rows atomically, so two running instances can't send the
-  same row. Still, run only one sender per database (`EMAIL_WORKER_ENABLED=false` elsewhere).
+## 16. Resync
+
+- **Not yet synced:** rows submitted before `setup`, or marked `⚠ Not synced` (server down, wrong
+  URL), are picked up by **Infinito → Resync unsent rows**.
+- **Bad data:** rows marked `❌` need fixing first. Correct the cells, select the rows, then use
+  **Resync selected rows**.
+- **Idempotent:** each row's Response ID maps to the same records, so resyncing never duplicates a
+  participant or a registration.
+
+On resync, only form data is refreshed: name, mobile, roll number, college, files, accommodation and
+remark. The following are never overwritten:
+- verification status and reviewer
+- the QR token
+- an email changed by staff (§25)
+- email history
+- check-in/check-out
+- audit history
+
+If an edited response drops a sport, that sport's unverified registration is removed. A verified or
+entered one is kept, with a warning in Status.
+
+## 17. Form field mapping
+
+Titles are matched ignoring letter case, extra spaces, and a trailing `*`, `:`, `.` or `?`. So
+`Email`, `Email ID`, `Email Address`, `Email Address *` and `Email Address:` all work. Aliases live
+in [src/forms/form-field-map.ts](src/forms/form-field-map.ts):
+
+| Field | Accepted titles (examples) |
+|---|---|
+| Email | Email, Email ID, Email Address, E-mail (plus the form's own collected email) |
+| Name | Name, Full Name, Participant Name |
+| College | College Name, College, Institute |
+| Sports (**required**: the event) | Sports, Sport, Event, Game |
+| Mobile | Mobile No., Mobile Number, Mobile, Phone, Phone Number, Contact Number |
+| Roll no. | College Roll No., College Roll Number, Roll No., Roll Number |
+| College ID image | College ID Card Photo, College ID Card, College ID, ID Card Photo |
+| Aadhaar | Aadhaar No. / Number (last 4 kept); Aadhaar Card Photo |
+| Expected arrival | Check In Date, Check-in Date, Arrival Date, Expected Arrival Date |
+| Expected departure | Check Out Date, Check-out Date, Departure Date, Expected Departure Date |
+| Accommodation | Accommodation, Accommodation Period |
+| Remark | Remark, Remarks, Comments |
+| Team forms | Team Name, Member {n} Name / Email / … (still supported) |
+
+Per-event differences go in `EVENT_FORM_FIELD_OVERRIDES`, keyed by the Sports slug. For example,
+`requireTransactionId: true` for a form that collects one; it is not required by default. Sports is
+always required.
+
+Normalisation:
+- Emails are lowercased.
+- Indian mobile numbers are reduced to 10 digits.
+- Drive links are reduced to file IDs.
+
+Invalid rows are rejected and every reason is listed in the Status column.
+
+> **"Check In Date" and "Check Out Date" are PLANNED dates** (expected arrival and expected
+> departure). They never become gate times; actual IN/OUT comes only from QR scans (§29–30).
+>
+> **Accepted formats:** `2026-10-05`, `05/10/2026` (day first, as used in India), `5-10-2026`,
+> `5.10.26`, `5 October 2026`, `05 Oct 2026` and `October 5, 2026`. The Apps Script sends Sheets
+> date cells as `yyyy-MM-dd` in the sheet's timezone.
+>
+> **Missing or unreadable dates** never reject a registration. They are kept as text, with a
+> warning in Status.
+
+## 18. Admin login
+
+Open `/login`, enter your email, and click the link that arrives by email:
+- It works once and expires after 15 minutes.
+- It is sent at most once per minute per account.
+- Admins land on `/admin/registrations`.
+
+## 19. Coordinator login
+
+Coordinators are added by an admin at `/admin/staff` with the role *coordinator*, and sign in the
+same way.
+
+## 20. Volunteer login
+
+Volunteers are added with the role *volunteer*, sign in the same way, and land on `/scan`.
+
+## 21. Manual verification
+
+Every imported registration starts as **PENDING**. On the participant page, a coordinator clicks
+**Verify**. In one transaction this:
+- marks the registration VERIFIED;
+- creates the participant's QR token if they don't have one yet;
+- queues exactly **one** automatic QR email;
+- records who did it and when.
+
+Simultaneous clicks can't create a second token or email. **Reject** needs a reason, which is
+emailed to the participant. Rejecting before entry revokes the pass; after any check-in, the
+registration can no longer be rejected. **Undo verification** works until the QR email has actually
+been sent. For a multi-member team form, these actions apply to the whole response.
+
+## 22. QR generation
+
+A QR token is 32 random bytes (`QR_TOKEN_BYTES`), created once per participant on their first
+verification. It is unrelated to any database ID. The QR encodes `<APP_BASE_URL>/p/<token>`.
+
+The token never changes: not on resend, bulk send, email change or re-verification. One participant
+has one token across all their events.
+
+## 23. Individual QR email
+
+After verification, the participant receives **their own** pass at **their current email**. The
+email shows their name, event and college, includes the QR inline, and attaches it as a PNG. The
+participant page shows how many times it was sent, the last send time, the delivery status and any
+failure.
+
+## 24. Repeated QR resend
+
+**Send QR email / Resend QR email** on the participant page can be used as many times as needed.
+`QR_MANUAL_RESEND_LIMIT=0` is the default and means unlimited.
+- **Same pass:** it always reuses the same token and goes to the participant's current email.
+- **Verified only:** unverified and rejected participants are refused.
+- **One at a time:** only one QR email per participant can be waiting at once, which stops double
+  clicks. The next send is allowed as soon as the previous one has gone out or failed.
+- **Retry after failure:** a failed email can be sent again.
+- **Audited:** every send records the staff member, recipient and time.
+
+## 25. Change email
+
+On the participant page, use **Change email**.
+- **Validated and normalised**, like form emails.
+- **Same participant:** the person keeps the same registrations, QR token, verification status and
+  entry history.
+- **History:** the old and new address are recorded with the staff member and time.
+- **Queued emails:** any still waiting are redirected to the new address.
+- **No automatic email:** use *Send QR email* afterwards if needed.
+- **Conflicts:** an address already used by another participant is refused, and records are never
+  merged.
+- **Resync-safe:** the old address is kept as an alias, so resyncing the old sheet row maps to the
+  same person and does not revert the change.
+
+## 26. College dashboard
+
+`/admin/colleges` lists every college with **Total / Verified / Pending / Inside / Outside**. The
+list can be filtered by event and searched by college name. A college's page shows:
+- event chips and the counters
+- all its participants, with status, gate state and QR email status
+- the two bulk actions
+- a history of college email runs with live sent, failed and waiting counts
+
+## 27. Send QR to all college students
+
+**Send QR to all verified students** sends every VERIFIED student of that college (in the selected
+event, or all events) **their own QR at their own email**:
+- Unverified and rejected students are excluded.
+- Existing tokens are reused.
+- One email is queued per registration through the outbox. A failed recipient doesn't affect the
+  others.
+- Clicking twice while emails are still waiting doesn't queue duplicates.
+- Each run is recorded as an `EmailBatch`: who, college, event, eligible and queued counts. Every
+  student's history also gets an entry.
+
+## 28. Send all college QR passes to one selected student
+
+**Send all college QR passes to one student** sends **one consolidated email** to the selected
+student's current address. It contains every verified student of that college (and event):
+- one entry per student, with their name, college and event(s)
+- the student's own QR inline, plus a PNG attachment named after them
+
+Each QR is still that student's own pass: no token is replaced or created. The email says clearly
+that each QR admits only its owner.
+
+Rules:
+- **Recipient:** must be a verified participant of the same college; anyone else is refused.
+- **Scope:** unverified and rejected students, and other colleges, are never included.
+- **Size:** more than 40 passes are split into numbered emails.
+- **Audit:** the run is recorded with the staff member, college, recipient, recipient email, pass
+  count and time.
+- **Who can do it:** coordinators and admins only.
+
+## 29. Check-in (actual IN)
+
+Every scan runs these checks in order, on the server:
+1. **Valid QR?** If not: *INVALID QR*.
+2. **Registration belongs to this pass?** A registration ID from a different pass is refused as
+   *INVALID QR*.
+3. **Verified?** If not: *NOT VERIFIED*.
+4. **Participant blocked?** If so: *ACCESS BLOCKED* (§30a).
+5. **Current state.** If *outside*, show **MARK ENTERED (CHECK IN)**. If *inside*, show
+   **CHECK OUT (OUT)**.
+
+Check-in rules:
+- **Atomic.** Check-in is one conditional database update that also requires "verified and not
+  blocked". Ten simultaneous taps give exactly one IN, and a block that lands mid-scan always wins.
+- **Already inside.** A second check-in is refused with *ALREADY ENTERED: inside since …*.
+- **Confirmation** shows the name, college, event and the exact server timestamp, e.g.
+  `✅ ENTERED (CHECK IN): Priya · NIT Patna · Football · 05 Oct 2026, 14:05:09`.
+- **Where:** at the gate (`/scan` → pass page), or with **Check in** on the participant page
+  (coordinators and admins).
+- **History.** Every attempt, successful or refused, is kept in the gate log, and the first-ever
+  entry time is preserved.
+
+### Manual CHECK IN / CHECK OUT (no QR)
+
+Staff can record IN and OUT without scanning a QR. Either way uses **exactly the same server-side
+logic** as a scan:
+- the same checks (verified, not blocked, current IN/OUT state)
+- the same atomic update of `insideSince`, `lastCheckInAt` and `lastCheckOutAt`
+- the same gate log (`EntryLog`) and history
+
+A manual action is labelled *manual (no QR scan)*, with the staff member, IN or OUT, the
+participant and the exact server time. Simultaneous manual and QR actions still produce exactly one
+state change.
+
+| Where | Who |
+|---|---|
+| Participant page → **CHECK IN** (when outside) / **CHECK OUT** (when inside) | Coordinators, admins |
+| `/scan` → *No QR? Find the participant* → gate card (`/gate/<registrationId>`) | Every gate role: volunteers, coordinators, admins |
+
+The volunteer search finds people by name or college only and shows only what the gate needs; no
+email, mobile or IDs. Blocked participants are refused there too. Only the admin override (§30a)
+can record a blocked participant's exit.
+
+## 30. Check-out (actual OUT)
+
+**CHECK OUT** appears on the pass page while the participant is inside, and on the participant page.
+- **Not inside.** Checking out someone who has never checked in, or who is already outside, is
+  refused and logged.
+- **Concurrent.** Ten simultaneous OUT taps give exactly one OUT.
+- **Re-entry.** After a check-out, the next scan offers CHECK IN again.
+
+## 30a. Block / unblock
+
+Coordinators and admins can **Block participant** on the participant page, with an optional reason.
+Blocking:
+- applies to the **whole participant**, because the QR is per participant, so every event is
+  blocked;
+- refuses every gate **IN and OUT**: through the pass page, `/p/<token>/enter|exit` called directly,
+  or the participant page's check-in;
+- shows the gate a neutral **ACCESS BLOCKED, please contact the coordinator/admin**, never the
+  reason;
+- **keeps everything else**: verification, the QR token, and all past IN/OUT records;
+- is recorded in the history with the staff member, time, reason, and whether they were inside;
+- adds them to the **Blocked** counter, also available as a filter chip.
+
+**Blocked while inside:** the participant stays recorded as *inside*, and their earlier IN record is
+untouched. The gate refuses both IN and OUT. To record that a blocked participant has left, an
+**admin** (not a coordinator or volunteer) can use **Admin override: record check-out**. It is
+logged as an override.
+
+**Unblock** restores normal scanning according to the current IN/OUT state. The QR token and
+verification are unchanged, and the earlier block stays in the history.
+
+Volunteers can't block or unblock; the server returns 403.
+
+## 31. Dashboard counters
+
+Counters are over **registrations** (one per participant per event), filtered by the current event
+and/or college:
+
+| Counter | Definition |
+|---|---|
+| **Total** | All registrations |
+| **Verified** | Manually verified by a coordinator/admin |
+| **Pending** | Not yet verified |
+| **Rejected** | Rejected during verification |
+| **Blocked** | Participant is blocked at the gate. Independent of the other counters; a blocked participant can still be counted as inside |
+| **Inside** | Checked in and not checked out (actual QR IN/OUT) |
+| **Outside** | Total − Inside: never entered, checked out, or not verified |
+
+Registering or verifying never counts as entry.
+
+## 32. Search / filter
+
+`/admin/registrations` lists **one row per registration**, i.e. per participant and event. Clicking
+a row opens that participant's page. It has:
+- **Status and gate views.** Every counter tile, and its matching chip, is a filter: **All ·
+  Pending · Verified · Rejected · Blocked · Inside · Outside** (`?status=inside` etc.). The active
+  one is highlighted.
+  - The counts always describe the current event, college, search and date filters, so each
+    view's rows add up to its tile.
+  - An empty view explains itself, e.g. *No registrations are inside under these filters. 5 match
+    otherwise*, instead of "No registrations match".
+- **Event filter** in the sidebar
+- **College filter** (`?college=`, linked from college pages)
+- **Expected arrival / expected departure** date pickers
+- **Search** by name, email, mobile (any formatting), college roll number, college name, team name,
+  transaction ID, or registration/team ID
+
+### Expected arrivals / departures
+
+`/admin/arrivals` and `/admin/departures` (nav: *Arrivals / departures*) show everyone whose
+**planned** date is the chosen day. Use **Today**, **Tomorrow**, or pick a date, and optionally an
+event and a college.
+
+| Page | Summary | Per row |
+|---|---|---|
+| Arrivals | Expected arrivals · Already arrived (QR IN at least once) · Not arrived yet · Blocked | Name, college, event, mobile, expected arrival, actual IN time, inside/outside, verification, blocked |
+| Departures | Expected departures · Checked out (QR OUT, not inside) · Still inside · Never arrived · Blocked | Name, college, event, expected departure, actual OUT time, inside/outside, verification, blocked |
+
+**By college** breaks the same numbers down per college, and every college page links to its own
+arrivals and departures. The **expected** counts come from the form dates. The **arrived,
+checked-out and inside** counts come only from QR gate scans.
+
+## 33. Staff roles
+
+Every rule below is enforced **on the server**, for page routes, POST actions and document URLs.
+Navigation only mirrors it; an unauthorised direct request gets **403**.
+
+| | Admin | Coordinator | Volunteer |
+|---|---|---|---|
+| Navigation | Dashboard, Inside, Outside, Blocked, Arrivals, Gate log, Colleges, Scan, Staff | same, without Staff | Scan, Find participant |
+| Participant page `/admin/registrations/<id>` | ✅ full | ✅ | ❌ (uses the gate card `/gate/<id>`) |
+| Aadhaar number | **full** (decrypted) | last 4 only | last 4 only |
+| Aadhaar image `/staff/files/<id>/aadhaar` | ✅ | ❌ 403 | ❌ 403 |
+| College ID image | ✅ | ✅ | ✅ (gate check) |
+| Email | ✅ | ✅ | masked (`p•••@example.com`) |
+| Mobile, roll no., accommodation, remark | ✅ | ✅ | ❌ |
+| Verify / reject / undo | ✅ | ✅ | only if `VOLUNTEERS_CAN_VERIFY=true` (verify from the gate card) |
+| Send / resend individual QR email | ✅ | ✅ | ✅ from the gate card (address shown masked) |
+| College bulk emails | ✅ | ✅ | ❌ 403 |
+| Change email | ✅ | ✅ | ✅ from the gate card only (same logic and audit); the dashboard route stays ❌ 403 |
+| Block / unblock | ✅ | ✅ | ❌ 403 |
+| Check IN/OUT: QR scan and manual gate card | ✅ | ✅ | ✅ |
+| Check IN/OUT from the participant page | ✅ | ✅ | ❌ |
+| Blocked-participant check-out override | ✅ | ❌ | ❌ |
+| Expected arrivals/departures, gate log, colleges | ✅ | ✅ | ❌ 403 |
+| Staff management | ✅ | ❌ 403 | ❌ 403 |
+
+**Find participant** (`/scan/find`) is a directory of **every** participant registration:
+- Search by name, college or event.
+- 50 per page.
+- Only name, college, event and status are shown, and only those columns are queried.
+
+Opening one shows the volunteer **gate card** (`/gate/<registrationId>`), their participant
+profile. It shows photo, name, college, event, Aadhaar last 4, the College ID link, a masked
+email, and verification and gate state. Its only actions are:
+- IN/OUT
+- **Send QR email** (this participant only)
+- **Change email**
+- **Verify**, only with `VOLUNTEERS_CAN_VERIFY=true`; otherwise the button is absent and the
+  server returns 403.
+
+### Mobile
+
+Every page works on phones; it was checked at 360, 390, 412 and 1280px in a real browser, with no
+horizontal page overflow.
+- **Navigation** collapses into a **☰ Menu** (CSS only).
+- **Tables** turn into stacked cards with labels.
+- **Profiles and forms** go single-column, and long emails and college names wrap.
+- **Touch targets:** buttons and links are at least 44px tall.
+- **Inputs** use 16px text, so iOS doesn't zoom in.
+- **Nothing depends on hover.**
+
+## 34. Resend / email worker
+
+All emails go through `EmailOutbox`:
+- registration received
+- QR pass
+- rejection
+- college bulk emails
+- sign-in links
+
+A background worker sends them through Resend. Configure it in `.env`:
+- `RESEND_API_KEY`
+- `MAIL_FROM` on a verified domain
+- `MAIL_REPLY_TO`
+- `RESEND_WEBHOOK_SECRET`, optional, for delivery tracking
+
+To check the setup, run `npm run email:test -- you@example.com`.
+
+How the worker behaves:
+- **No duplicates.** Each email has a unique idempotency key, which is also sent to Resend.
+  Retries, double clicks and crashes never duplicate an email.
+- **Concurrency.** Rows are claimed atomically, so two instances never send the same row. Still, run
+  only one sender per database (`EMAIL_WORKER_ENABLED=false` elsewhere).
 - **Errors:**
   - An invalid recipient fails only that email.
   - Rate limits, used-up quota, a bad key or an unverified sender pause the whole queue without
     using up attempts.
-  - 5xx errors retry with exponential backoff, up to `EMAIL_MAX_ATTEMPTS`.
-  - `EMAIL_DAILY_CAP` throttles sending while a new domain warms up.
+  - 5xx errors retry with backoff, up to `EMAIL_MAX_ATTEMPTS`.
+- **Delivery tracking.** With the Resend webhook set to `<APP_BASE_URL>/webhooks/resend` (events
+  `email.delivered`, `email.delivery_delayed`, `email.bounced`, `email.complained`, `email.failed`,
+  `email.suppressed`), delivery and bounce status appear in the dashboard.
+- **Test mode.** `EMAIL_TEST_RECIPIENT` redirects every email to one inbox in development; it is
+  ignored in production.
 
-## 18. QR email flow
+## 35. Google Drive
 
-1. A coordinator clicks **Verify payment** on a team.
-2. In one transaction, the app:
-   - checks the transaction ID isn't verified for another team;
-   - marks every member VERIFIED;
-   - creates each member's QR token if they don't have one: 32 random bytes, one per person,
-     reused across events;
-   - queues **exactly one** QR email per member.
-3. The emails wait `DECISION_EMAIL_DELAY_SECONDS` (the undo window) and then send. Each member
-   gets their own pass. The QR encodes `<APP_BASE_URL>/p/<token>`; it is inline in the email and
-   also attached as a PNG.
-4. Clicking Verify again (or 5 times at once) never queues another email. Undo → Verify re-arms the
-   same email instead of creating a new one.
-
-## 19. Manual QR resend
-
-On the team page each verified member has a **Resend QR email** button with
-"Sent N× · last … · Manual resends used/limit".
-
-- The resend reuses the **same QR token**. Earlier emails stay valid, and no new token or
-  registration is ever created.
-- It goes to the participant's registered email.
-- It is only allowed while the registration is VERIFIED. Unverified or rejected registrations are
-  refused.
-- The limit is `QR_MANUAL_RESEND_LIMIT` (default **3**) manual sends per participant per event.
-  The automatic first email doesn't count.
-- A resend is refused while another QR email for that participant is still queued. Simultaneous
-  clicks are serialised by a database lock, so they can't exceed the limit.
-- If an email failed, for example after a bounce, use Resend to try again; it counts toward the
-  same limit.
-- Each resend is recorded in the history with who clicked it.
-
-## 20. Staff roles
-
-| Role | Can |
-|---|---|
-| `ADMIN` | Everything coordinators can, plus `/admin/staff` (add staff, change roles, disable) |
-| `COORDINATOR` | Registrations, search, verify/reject/undo payments, QR resends, entries, history |
-| `VOLUNTEER` | `/scan` and pass pages only: photo, name, college, team, event, ID, MARK ENTERED |
-
-Roles are enforced on the server for every route, including direct URLs and POSTs. Volunteers never
-see email, phone or transaction IDs.
-
-How sign-in works:
-- Staff sign in with a single-use link that expires after 15 minutes. It's sent at most once per
-  minute per account, and the login form is also limited per IP.
-- Sessions are `HttpOnly` and `SameSite=Lax` cookies, `Secure` over https, and are stored hashed.
-- Disabling an account signs it out everywhere.
-
-## 21. Admin dashboard
-
-- **`/admin/registrations`:**
-  - an event sidebar with team counts and pending counts
-  - search by participant name, email, team name, transaction ID, or registration/team ID
-  - payment-status chips and a duplicate-transaction badge
-- **`/admin/teams/<id>`:**
-  - members, contact details, photo and ID links
-  - payment details, Verify, Reject (a reason is required and is emailed to the captain), and Undo
-    (until the QR emails have actually been sent)
-  - QR email status and Resend, entry state per member
-  - all emails with their delivery status, and the full activity history
-- **`/admin/entries`:** every scan, including refused repeats, by event.
-
-Payment rules:
-- Decisions apply to the whole team, meaning the whole form response.
-- Rejecting before entry revokes the passes. The pass page then shows *DO NOT ADMIT*, and any QR
-  email not yet sent is cancelled.
-- Once any member has entered, the team can no longer be rejected.
-- After a rejection, the team can submit the form again with a new transaction ID and goes back to
-  Pending.
-
-## 22. Volunteer scan flow
-
-1. Open `/scan` (it asks for the camera), or scan with the phone's normal camera app. The QR is a
-   URL that opens the pass page in the browser where the volunteer is signed in.
-2. The pass page shows:
-   - photo, name, college, and an ID link
-   - for each event: team, team entry progress, and the verdict
-3. The verdict is a big **MARK ENTERED** button if the payment is verified.
-4. Tapping it records the entry once. Ten simultaneous taps still produce one entry, and every
-   repeat is logged as refused.
-5. A repeat scan shows **ALREADY ENTERED** with the time, the volunteer and the gate.
-6. Anonymous visitors see only "Show this QR to a volunteer". Unknown tokens show *NOT A VALID
-   PASS*.
-
-## 23. Google Drive setup (photos and IDs)
-
-1. Create a Google Cloud service account (no roles needed) and download a JSON key.
+1. Create a Google Cloud service account and a JSON key.
 2. Share each form's upload folder in Drive with the service account's email as **Viewer**.
 3. Put the JSON in `GOOGLE_SERVICE_ACCOUNT_JSON`, either raw or base64-encoded.
 
-Files are fetched on demand and served only to signed-in staff at `/staff/files/<personId>/photo|id`.
-- Allowed types: images and PDFs, up to 10 MB.
-- Responses are private and briefly cached.
-- Drive URLs and the key are never sent to browsers.
-- Missing or inaccessible files show "No photo"; they never cause an error page.
+Files are proxied at `/staff/files/<personId>/photo|id|aadhaar`:
+- **Who can open them:** signed-in staff only, and Aadhaar for coordinators and admins only.
+- **Allowed files:** images and PDFs, up to 10 MB.
+- **Privacy:** responses are private and briefly cached, and the key and Drive URLs never reach the
+  browser.
+- **Missing files** show as "not uploaded"; they never cause an error page.
 
-## 24. Production deployment checklist
+## 36. Production environment
 
-- [ ] PostgreSQL provisioned; `DATABASE_URL` set; run `npx prisma migrate deploy` on each release.
-- [ ] `NODE_ENV=production`, `APP_BASE_URL=https://<domain>`, served over HTTPS.
-- [ ] `APP_SECRET` (`openssl rand -hex 32`) and `FORMS_WEBHOOK_SECRET` (`openssl rand -hex 24`) set.
-- [ ] `RESEND_API_KEY`, `MAIL_FROM` on a verified domain (SPF/DKIM/DMARC), `MAIL_REPLY_TO` set;
-      `EMAIL_TEST_RECIPIENT` unset; `npm run email:test` succeeds.
-- [ ] Resend webhook → `https://<domain>/webhooks/resend`, `RESEND_WEBHOOK_SECRET` set.
-- [ ] `BOOTSTRAP_ADMIN_EMAILS` set for the first admin; other staff added in `/admin/staff`.
+With `NODE_ENV=production` the app **refuses to start** if any of these is true:
+- `APP_SECRET` is shorter than 32 characters.
+- `FORMS_WEBHOOK_SECRET` is shorter than 24 characters, or is still the placeholder.
+- `APP_BASE_URL` is not `https://`.
+- `RESEND_API_KEY` is missing.
+
+Production also ignores `EMAIL_TEST_RECIPIENT`. Cookies are `Secure` over https.
+
+## 37. Deployment
+
+```bash
+npm ci
+npm run build
+npx prisma migrate deploy
+npm run start:prod        # node dist/src/main
+```
+
+Checklist:
+- [ ] PostgreSQL provisioned; migrations applied on each release.
+- [ ] HTTPS and a host that doesn't sleep (cold starts at the gate are not acceptable).
+- [ ] All production variables set (§36); `MAIL_FROM` on a verified domain with SPF, DKIM and DMARC.
 - [ ] Exactly one instance with `EMAIL_WORKER_ENABLED=true`.
-- [ ] Host does not sleep (cold starts at the gate are not acceptable).
-- [ ] Apps Script `WEBHOOK_URL` → `https://<domain>/webhooks/forms/submit`, `WEBHOOK_SECRET` updated,
-      **Resync unsent rows** run once.
-- [ ] Drive service account set up if photos/IDs are needed.
-- [ ] Gate dry run on real phones; printed per-event name lists as the offline fallback.
+- [ ] Resend webhook configured (optional).
+- [ ] First admin via `BOOTSTRAP_ADMIN_EMAILS`; other staff added in `/admin/staff`.
+- [ ] Apps Script `WEBHOOK_URL` and `WEBHOOK_SECRET` updated; *Resync unsent rows* run once.
+- [ ] Drive service account set up if photos are needed.
+- [ ] Gate dry run on real phones, plus printed per-college name lists as the offline fallback.
 
-Build and start: `npm ci && npm run build && npx prisma migrate deploy && npm run start:prod`.
-The Prisma CLI is a regular dependency, so migrations also work in a production-only install.
 A Cloudflare tunnel is only a local testing aid; the app doesn't depend on one.
 
-## 25. Security considerations
+## 38. Security
 
 - **Webhooks.**
   - Forms: a shared secret, compared in constant time.
-  - Resend: a signed payload (Standard Webhooks), checked against the raw request body.
+  - Resend: a signed payload, checked against the raw request body.
 - **Auth.**
-  - Magic links: single use, short-lived, stored hashed, consumed only on POST so email link
-    scanners can't burn them.
-  - Sessions: stored hashed, revocable.
-  - Staff roles: checked on the server for every route.
+  - Magic links: single use, short-lived, stored hashed, consumed only on POST.
+  - Sessions: stored hashed, revocable; disabling a staff member signs them out everywhere.
+- **Authorization.** Roles are checked on the server for every route. Every ID in a URL is
+  resolved on the server:
+  - a participant from another college can't be used as a bulk recipient;
+  - a registration ID from another person's pass is refused at the gate;
+  - unknown IDs return 404.
 - **CSRF and cross-site requests.**
   - Every staff form carries a per-session HMAC token.
-  - All non-webhook POSTs from another origin are rejected.
-  - Cookies are `SameSite=Lax`.
-- **XSS.**
-  - All HTML is built with an auto-escaping template helper.
-  - Helmet's default CSP (`script-src 'self'`) blocks inline scripts.
-  - Participant files are served with `nosniff`, and images are sandboxed.
-- **Data exposure.**
-  - QR tokens are random, unrelated to database IDs, and unguessable.
-  - Pass pages reveal nothing to anonymous visitors, and volunteers see no email, phone or
-    transaction ID.
-  - Signed-in pages are `Cache-Control: no-store`.
+  - All non-webhook POSTs from another site are rejected (`Sec-Fetch-Site`, then `Origin`/`Referer`).
+  - Cookies are `HttpOnly` and `SameSite=Lax`; `Referrer-Policy` is `same-origin`.
+- **XSS.** All HTML is built with an escaping template helper, the default Content-Security-Policy
+  blocks inline scripts, and file responses use `nosniff` (images are sandboxed).
+- **Data minimisation.**
+  - The full Aadhaar number is stored only encrypted (and only with `AADHAAR_ENCRYPTION_KEY`).
+  - Pages are role-filtered on the server: non-admins never receive the full number, the
+    encrypted value, or an Aadhaar link. The Aadhaar image route is admin-only.
+  - Volunteers see no email, mobile or roll number; QR email confirmations mask the address.
+  - Staff pages are `Cache-Control: no-store`.
+  - QR tokens are random and unrelated to database IDs.
 - **Concurrency.**
-  - Verify and reject take per-team and per-transaction database locks.
-  - Entry is a conditional update, so only one tap can succeed.
-  - QR resends take a per-registration lock.
-  - Email enqueueing is protected by unique idempotency keys.
-- **Abuse.**
-  - The login form is limited per IP, and sign-in emails are limited per account.
-  - Resends are capped.
-  - Inputs are validated with zod or explicit parsing.
-  - SQL goes only through Prisma or parameterised tagged templates.
-- **Secrets.** Secrets live only in the environment; nothing is hardcoded, and `.env*` is
-  git-ignored except `.env.example`.
+  - Verify, reject, resend, college bulk sends and email changes take database locks.
+  - Check-in and check-out are conditional updates.
+  - Email enqueueing is protected by unique keys.
+- **Secrets.** Secrets come only from the environment, and `.env*` is git-ignored except
+  `.env.example`.
+
+## 39. Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Sheet shows `⚠ Not synced (HTTP 404 …)` | `WEBHOOK_URL` is wrong; fix it, then *Resync unsent rows* |
+| `❌ Webhook secret mismatch` | Script `WEBHOOK_SECRET` ≠ server `FORMS_WEBHOOK_SECRET` |
+| `❌ Member 1: … is not a valid email` | Fix the cell, select the row, *Resync selected rows* |
+| Login says "Cross-site request blocked" | Hard-reload `/login` (an old cached page); make sure you use the same host as `APP_BASE_URL` |
+| No sign-in email in development | Without `RESEND_API_KEY` the link is in the server log |
+| Emails stay "queued" | Check the server log for "Email sending paused/disabled": key, `MAIL_FROM` or quota |
+| "No photo" everywhere | `GOOGLE_SERVICE_ACCOUNT_JSON` missing, or folders not shared with the service account |
+| A participant appears twice under different events | The Sports answer changed spelling; fix the form option and resync |
+| `❌ Sports is missing …` | The row has no Sports answer; fill it in the sheet and *Resync selected rows*. If Status adds "(no Sports/Sport/Event/Game column found …)", the script couldn't find the column: check the header and the execution log |
+| Participant has no QR with them at the gate | `/scan` → *No QR? Find the participant* → check photo/ID → manual CHECK IN |
+| Expected arrival shows "(not a date)" | The form answer isn't a recognised date (§17); fix the cell and *Resync selected rows* |
+| Gate shows ACCESS BLOCKED | The participant is blocked; a coordinator/admin can see the reason and unblock on the participant page |
+| App refuses to start in production | Read the "Refusing to start in production: …" message (§36) |
+
+## 40. Testing
+
+```bash
+npm run check-types && npm run lint && npm run build
+npm test                                        # unit tests
+E2E_DATABASE_URL="postgresql://postgres:infinito_dev_pwd@localhost:5433/infinito_e2e" npm run test:e2e
+npx prisma validate && npx prisma migrate status
+```
+
+The e2e suites boot the real app against PostgreSQL. They truncate every table, so they only run
+against a database whose name contains `e2e` or `test`; migrations are applied automatically.
+Create one once with:
+
+```bash
+docker exec infinito_registration_postgres psql -U postgres -c "create database infinito_e2e"
+```
+
+When `NODE_ENV=test`, the app ignores `.env`, and emails use the console transport or a test fake,
+so tests never send real email.
+
+The six suites:
+- `test/app.e2e-spec.ts`: core flows, roles, CSRF and cross-site checks, concurrency.
+- `test/roles.e2e-spec.ts`: covers the following:
+  - admin, coordinator and volunteer access to every route, called directly (403s included)
+  - full vs last-4 Aadhaar
+  - the Aadhaar and College ID documents
+  - navigation per role
+- `test/apps-script.e2e-spec.ts`: runs the real `registration-form.gs` against fake Google
+  services and checks the following:
+  - the payload it builds (`"Sports": "TT"`) for `handleFormSubmit` and `resyncUnsent`
+  - that payload arriving at the backend and creating `eventSlug = tt`
+  - the Status cell written from the server's reply
+- `test/gate-views.e2e-spec.ts`: covers the following:
+  - Sports as the only event source
+  - the Inside, Outside, Blocked and status views
+  - clickable participant rows
+  - manual IN/OUT sharing state with QR scans
+  - email-change permissions
+- `test/expected-block.e2e-spec.ts`: covers the following:
+  - expected vs actual dates, and the arrivals/departures dashboards
+  - the IN → OUT → IN cycle
+  - blocking: refused scans, direct POSTs, the admin override, unblock, audit
+  - concurrency of blocked and unblocked scans
+- `test/workflow.e2e-spec.ts`: the individual-form workflow, including:
+  - import, resync and duplicate submissions
+  - verification, repeated QR sends, email change
+  - both college bulk sends
+  - IN/OUT, counters, privacy and search

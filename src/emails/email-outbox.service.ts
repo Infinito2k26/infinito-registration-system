@@ -12,6 +12,8 @@ export interface OutboxEmail {
   registrationId?: string;
   /** Staff member whose action caused this email. */
   triggeredById?: string;
+  /** Bulk college send this email belongs to. */
+  batchId?: string;
   sendAt?: Date;
 }
 

@@ -1,11 +1,27 @@
-import { Controller, Get, NotFoundException, Param, ParseUUIDPipe, Res, UseFilters, UseGuards } from '@nestjs/common';
+import {
+  Controller,
+  ForbiddenException,
+  Get,
+  NotFoundException,
+  Param,
+  ParseUUIDPipe,
+  Req,
+  Res,
+  UseFilters,
+  UseGuards,
+} from '@nestjs/common';
+import { StaffRole } from '@prisma/client';
+import { StaffRequest } from '../auth/auth.types';
 import { Response } from 'express';
 import { StaffGuard } from '../auth/staff.guard';
 import { PrismaService } from '../prisma/prisma.service';
 import { WebExceptionFilter } from '../web/web-exception.filter';
 import { DriveService } from './drive.service';
 
-/** Participant photo / ID image, for any signed-in staff (volunteers need it at the gate). */
+/**
+ * Participant files. Photo and college ID card: any signed-in staff (volunteers check them at
+ * the gate). Aadhaar card: admins only.
+ */
 @Controller('staff/files')
 @UseGuards(StaffGuard)
 @UseFilters(WebExceptionFilter)
@@ -19,14 +35,19 @@ export class DriveController {
   async file(
     @Param('personId', ParseUUIDPipe) personId: string,
     @Param('kind') kind: string,
+    @Req() req: StaffRequest,
     @Res() res: Response,
   ) {
-    if (kind !== 'photo' && kind !== 'id') throw new NotFoundException();
+    if (kind !== 'photo' && kind !== 'id' && kind !== 'aadhaar') throw new NotFoundException();
+    // Aadhaar images: ADMIN only, checked on every request (a copied link doesn't help anyone else).
+    if (kind === 'aadhaar' && req.staff!.role !== StaffRole.ADMIN) {
+      throw new ForbiddenException('Aadhaar documents are only available to admins');
+    }
     const person = await this.prisma.person.findUnique({
       where: { id: personId },
-      select: { photoDriveId: true, idDocumentDriveId: true },
+      select: { photoDriveId: true, idDocumentDriveId: true, aadhaarDriveId: true },
     });
-    const fileId = kind === 'photo' ? person?.photoDriveId : person?.idDocumentDriveId;
+    const fileId = { photo: person?.photoDriveId, id: person?.idDocumentDriveId, aadhaar: person?.aadhaarDriveId }[kind];
     const file = fileId ? await this.drive.fetchFile(fileId) : null;
     if (!file) throw new NotFoundException('File not available');
     res

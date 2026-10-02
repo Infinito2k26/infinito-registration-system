@@ -2,11 +2,11 @@ import { z } from 'zod';
 
 /** Body POSTed by the Apps Script in apps-script/registration-form.gs. */
 export const formSubmissionSchema = z.object({
-  eventSlug: z
-    .string()
-    .trim()
-    .toLowerCase()
-    .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'must be a slug like "code-sprint"'),
+  /**
+   * Ignored. Older versions of the Apps Script sent the sheet's EVENT_SLUG; the event now comes
+   * only from the form's Sports answer. Still accepted so an old script keeps syncing.
+   */
+  eventSlug: z.string().max(100).optional(),
   /** Response sheet's spreadsheet ID; together with responseId identifies the row. */
   sourceForm: z.string().trim().min(1).max(200),
   sourceSheet: z.string().trim().max(200).optional(),
