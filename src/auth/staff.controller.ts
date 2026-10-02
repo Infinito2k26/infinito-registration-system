@@ -62,7 +62,7 @@ export class StaffController {
           <p class="muted small">Volunteers can only scan and mark entry. Coordinators manage registrations and payments. Admins also manage staff. People sign in with an emailed link; no passwords.</p>
         </section>
         <section class="card">
-          <table class="table">
+          <div class="table-wrap"><table class="table">
             <thead><tr><th>Email</th><th>Name</th><th>Role</th><th>Last seen</th><th>Status</th><th></th></tr></thead>
             <tbody>
               ${staff.map(
@@ -79,7 +79,7 @@ export class StaffController {
                 </tr>`,
               )}
             </tbody>
-          </table>
+          </table></div>
         </section>`,
       }),
     );

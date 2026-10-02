@@ -15,7 +15,19 @@ export const EmailTemplate = {
   QrPass: 'qr-pass',
   PaymentRejected: 'payment-rejected',
   StaffLogin: 'staff-login',
+  /** Several students' own passes, sent together to one selected student. */
+  CollegePasses: 'college-passes',
 } as const;
+
+export interface CollegePass {
+  name: string;
+  events: string;
+  qrUrl: string;
+}
+
+/** Safe attachment file name from a student's name. */
+const fileName = (name: string, i: number) =>
+  `${String(i + 1).padStart(2, '0')}-${name.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'student'}-pass.png`;
 
 const s = (payload: Payload, key: string) => String(payload[key] ?? '');
 const e = (payload: Payload, key: string) => escapeHtml(s(payload, key));
@@ -39,11 +51,11 @@ export async function renderEmail(template: string, payload: Payload): Promise<R
       return {
         html: layout(`<p>Hi ${e(payload, 'name')},</p>
 <p>We've received your registration for <b>${e(payload, 'eventName')}</b>${teamSuffixHtml(payload)}.</p>
-<p>Our team is verifying the payment${payload.transactionId ? ` for transaction <b>${e(payload, 'transactionId')}</b>` : ''}. Once it's verified, you'll get a separate email with your personal QR entry pass.</p>`),
+<p>Our team will verify your registration${payload.transactionId ? ` (transaction <b>${e(payload, 'transactionId')}</b>)` : ''}. Once it's verified, you'll get a separate email with your personal QR entry pass.</p>`),
         text: `Hi ${s(payload, 'name')},
 
 We've received your registration for ${s(payload, 'eventName')}${teamSuffixText(payload)}.
-Our team is verifying the payment. Once it's verified, you'll get a separate email with your personal QR entry pass.`,
+Our team will verify your registration. Once it's verified, you'll get a separate email with your personal QR entry pass.`,
       };
 
     case EmailTemplate.QrPass: {
@@ -51,13 +63,13 @@ Our team is verifying the payment. Once it's verified, you'll get a separate ema
       const png = await qrPng(url);
       return {
         html: layout(`<p>Hi ${e(payload, 'name')},</p>
-<p>Your payment is verified. This is your entry pass for <b>${e(payload, 'eventName')}</b>${teamSuffixHtml(payload)}.</p>
+<p>Your registration is verified. This is your personal entry pass for <b>${e(payload, 'eventName')}</b>${teamSuffixHtml(payload)}${payload.college ? ` (${e(payload, 'college')})` : ''}.</p>
 <p style="text-align:center"><img src="cid:qr-pass" width="240" height="240" alt="Your QR entry pass"></p>
 <p>Show this QR at the gate along with your college ID. It is personal: one scan lets one person in, and the same pass covers all your Infinito events.</p>
 <p style="font-size:13px;color:#52606d">The QR is also attached as an image so you can save it offline.</p>`),
         text: `Hi ${s(payload, 'name')},
 
-Your payment is verified. This is your entry pass for ${s(payload, 'eventName')}${teamSuffixText(payload)}.
+Your registration is verified. This is your personal entry pass for ${s(payload, 'eventName')}${teamSuffixText(payload)}${payload.college ? ` (${s(payload, 'college')})` : ''}.
 Show the attached QR image at the gate, along with your college ID.
 Pass link: ${url}
 
@@ -71,16 +83,48 @@ The pass is personal: one scan lets one person in.`,
     case EmailTemplate.PaymentRejected:
       return {
         html: layout(`<p>Hi ${e(payload, 'name')},</p>
-<p>We couldn't verify the payment for your <b>${e(payload, 'eventName')}</b> registration${teamSuffixHtml(payload)}${payload.transactionId ? `, transaction <b>${e(payload, 'transactionId')}</b>` : ''}.</p>
+<p>We couldn't verify your <b>${e(payload, 'eventName')}</b> registration${teamSuffixHtml(payload)}${payload.transactionId ? `, transaction <b>${e(payload, 'transactionId')}</b>` : ''}.</p>
 <p><b>Reason:</b> ${e(payload, 'remarks')}</p>
-<p>Please submit the registration form again with the correct transaction ID, or reply to this email if you think this is a mistake.</p>`),
+<p>Please submit the registration form again with the correct details, or reply to this email if you think this is a mistake.</p>`),
         text: `Hi ${s(payload, 'name')},
 
-We couldn't verify the payment for your ${s(payload, 'eventName')} registration${teamSuffixText(payload)}.
+We couldn't verify your ${s(payload, 'eventName')} registration${teamSuffixText(payload)}.
 Reason: ${s(payload, 'remarks')}
 
-Please submit the registration form again with the correct transaction ID, or reply to this email if you think this is a mistake.`,
+Please submit the registration form again with the correct details, or reply to this email if you think this is a mistake.`,
       };
+
+    case EmailTemplate.CollegePasses: {
+      const passes = (payload.passes ?? []) as CollegePass[];
+      const pngs = await Promise.all(passes.map((p) => qrPng(p.qrUrl)));
+      const part = Number(payload.parts) > 1 ? ` (part ${s(payload, 'part')} of ${s(payload, 'parts')})` : '';
+      const rows = passes
+        .map(
+          (p, i) => `<tr><td style="padding:12px 0;border-top:1px solid #e4e7eb;vertical-align:top">
+<b>${escapeHtml(p.name)}</b><br><span style="color:#52606d">${escapeHtml(s(payload, 'college'))}</span><br>${escapeHtml(p.events)}<br>
+<a href="${escapeHtml(p.qrUrl)}" style="font-size:13px">Pass link</a></td>
+<td style="padding:12px 0 12px 12px;border-top:1px solid #e4e7eb;text-align:right"><img src="cid:pass-${i}" width="140" height="140" alt="QR pass of ${escapeHtml(p.name)}"></td></tr>`,
+        )
+        .join('');
+      return {
+        html: layout(`<p>Hi ${e(payload, 'recipientName')},</p>
+<p>These are the personal entry passes of <b>${passes.length}</b> verified participant(s) from <b>${e(payload, 'college')}</b>${payload.eventName ? ` for <b>${e(payload, 'eventName')}</b>` : ''}${escapeHtml(part)}.</p>
+<p><b>Each QR belongs to the student named next to it and admits only that student.</b> Please forward each pass to its owner; every QR is also attached as a named image.</p>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0">${rows}</table>`),
+        text: `Hi ${s(payload, 'recipientName')},
+
+Entry passes of ${passes.length} verified participant(s) from ${s(payload, 'college')}${part}.
+Each QR belongs to the student named with it and admits only that student. The QR images are attached.
+
+${passes.map((p) => `- ${p.name} (${p.events}): ${p.qrUrl}`).join('\n')}`,
+        attachments: passes.map((p, i) => ({
+          filename: fileName(p.name, i),
+          content: pngs[i],
+          contentType: 'image/png',
+          contentId: `pass-${i}`,
+        })),
+      };
+    }
 
     case EmailTemplate.StaffLogin:
       return {

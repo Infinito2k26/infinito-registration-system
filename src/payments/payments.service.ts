@@ -68,7 +68,7 @@ export class PaymentsService {
       const activity: ActivityEntry[] = [];
       for (const reg of toVerify) {
         // Conditional update so two verifications touching the same person agree on one token.
-        await tx.person.updateMany({
+        const created = await tx.person.updateMany({
           where: { id: reg.personId, qrToken: null },
           data: { qrToken: generateQrToken() },
         });
@@ -88,7 +88,7 @@ export class PaymentsService {
           registrationId: reg.id,
           type: ActivityType.PAYMENT_VERIFIED,
           actorId,
-          details: { transactionId: txn ?? null, previousStatus: reg.paymentStatus },
+          details: { transactionId: txn ?? null, previousStatus: reg.paymentStatus, qrTokenCreated: created.count === 1 },
         });
 
         if (await this.qrEmails.queueInitial(tx, { ...updated, person }, { teamName: team.name, actorId })) {
@@ -104,7 +104,7 @@ export class PaymentsService {
       return {
         changed: toVerify.length,
         emailsQueued,
-        message: `Verified ${toVerify.length} member(s); ${emailsQueued} QR email(s) go out in ${this.config.decisionEmailDelaySeconds}s unless undone`,
+        message: `Verified ${toVerify.length} participant(s); ${emailsQueued} QR email(s) go out in ${this.config.decisionEmailDelaySeconds}s unless undone`,
       };
     });
   }
@@ -115,7 +115,7 @@ export class PaymentsService {
 
     return this.inTeamLock(teamId, async (tx, team) => {
       if (team.registrations.some((r) => r.enteredAt)) {
-        throw new PaymentActionError('A member of this team has already entered; payment can no longer be rejected');
+        throw new PaymentActionError('Already entered (checked in at least once); the registration can no longer be rejected');
       }
       const alreadyRejected = team.registrations.every(
         (r) => r.paymentStatus === PaymentStatus.REJECTED && r.paymentRemarks === reason,
@@ -160,7 +160,7 @@ export class PaymentsService {
             registrationId: captain.id,
             triggeredById: actorId,
             template: EmailTemplate.PaymentRejected,
-            subject: `Infinito 2K26: payment issue with your ${this.config.eventName(team.eventSlug)} registration`,
+            subject: `Infinito 2K26: issue with your ${this.config.eventName(team.eventSlug)} registration`,
             sendAt: new Date(now.getTime() + this.config.decisionEmailDelaySeconds * 1000),
             payload: {
               name: captain.person.name ?? '',
@@ -177,7 +177,7 @@ export class PaymentsService {
       return {
         changed: team.registrations.length,
         emailsQueued,
-        message: `Rejected. The captain (${captain.person.email}) is emailed in ${this.config.decisionEmailDelaySeconds}s`,
+        message: `Rejected. ${captain.person.email} is emailed the reason in ${this.config.decisionEmailDelaySeconds}s`,
       };
     });
   }
@@ -186,9 +186,9 @@ export class PaymentsService {
   async undoVerification(teamId: string, actorId: string): Promise<PaymentActionResult> {
     return this.inTeamLock(teamId, async (tx, team) => {
       const verified = team.registrations.filter((r) => r.paymentStatus === PaymentStatus.VERIFIED);
-      if (verified.length === 0) throw new PaymentActionError('Nothing to undo: no member is verified');
+      if (verified.length === 0) throw new PaymentActionError('Nothing to undo: not verified');
       if (verified.some((r) => r.enteredAt)) {
-        throw new PaymentActionError('A member has already entered; reject the payment instead if needed');
+        throw new PaymentActionError('Already entered; reject instead if needed');
       }
       const ids = verified.map((r) => r.id);
       const gone = await tx.emailOutbox.count({

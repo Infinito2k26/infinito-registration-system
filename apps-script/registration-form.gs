@@ -1,12 +1,13 @@
 /**
  * Infinito 2K26: registration form -> server sync.
  *
- * Install once per event, in the form's RESPONSE SPREADSHEET (Extensions -> Apps Script):
+ * Install once per form, in the form's RESPONSE SPREADSHEET (Extensions -> Apps Script):
  *   1. Paste this file.
  *   2. Project Settings -> Script properties:
  *        WEBHOOK_URL     https://<server>/webhooks/forms/submit  (or just https://<server>)
  *        WEBHOOK_SECRET  same value as the server's FORMS_WEBHOOK_SECRET
- *        EVENT_SLUG      e.g. code-sprint  (lowercase, hyphens)
+ *      (No EVENT_SLUG: the event comes from each row's "Sports" answer. An old EVENT_SLUG
+ *       property is simply ignored.)
  *   3. Run `setup` once from the editor and approve the permissions.
  *
  * This sheet is the import layer only. Payment verification, QR emails and entry happen
@@ -19,11 +20,13 @@
  */
 
 var HELPER_COLUMNS = ['Status', 'Response ID'];
-// Payment / Remarks: columns from an earlier version of this script; never sent as answers.
-var LEGACY_COLUMNS = ['Payment', 'Remarks'];
-var SKIP_COLUMNS = ['Timestamp', 'Email Address'].concat(HELPER_COLUMNS, LEGACY_COLUMNS);
+// Every other column (including a form question called "Remark(s)") is sent as an answer;
+// the server ignores titles it doesn't map.
+var SKIP_COLUMNS = ['Timestamp', 'Email Address'].concat(HELPER_COLUMNS);
 var MAX_ATTEMPTS = 3;
 var WEBHOOK_PATH = '/webhooks/forms/submit';
+// The event comes ONLY from this column; its value is always sent as answers.Sports.
+var SPORT_HEADERS = ['sports', 'sport', 'event', 'game'];
 
 function setup() {
   var sheet = getResponseSheet_();
@@ -84,9 +87,8 @@ function syncRow_(sheet, row) {
   var props = PropertiesService.getScriptProperties();
   var url = normalizeWebhookUrl_(props.getProperty('WEBHOOK_URL'));
   var secret = props.getProperty('WEBHOOK_SECRET');
-  var eventSlug = props.getProperty('EVENT_SLUG');
-  if (!url || !secret || !eventSlug) {
-    throw new Error('Set WEBHOOK_URL, WEBHOOK_SECRET and EVENT_SLUG in Script properties');
+  if (!url || !secret) {
+    throw new Error('Set WEBHOOK_URL and WEBHOOK_SECRET in Script properties');
   }
 
   var cols = ensureHelperColumns_(sheet);
@@ -104,14 +106,25 @@ function syncRow_(sheet, row) {
   var respondentEmail = '';
   headers.forEach(function (header, i) {
     header = String(header).trim();
-    if (header === 'Timestamp' && values[i] instanceof Date) timestamp = values[i].toISOString();
+    if (header === 'Timestamp' && isDate_(values[i])) timestamp = values[i].toISOString();
     if (header === 'Email Address') respondentEmail = String(values[i] || '');
     if (!header || SKIP_COLUMNS.indexOf(header) !== -1) return;
     answers[header] = formatCell_(values[i]);
   });
 
+  // The event: read the sport column explicitly and always send it as answers.Sports, whatever
+  // the exact header text is. An empty or missing value is sent as '' / left out, and the
+  // server answers "Sports is missing" (there is no fallback event).
+  var sportCol = findSportColumn_(headers);
+  var sportValue = sportCol === -1 ? '' : formatCell_(values[sportCol]).trim();
+  if (sportCol !== -1) answers.Sports = sportValue;
+  console.log(
+    'Infinito sync row ' + row + ': Sports column ' +
+      (sportCol === -1 ? 'NOT FOUND (headers: ' + headers.join(' | ') + ')' : '"' + headers[sportCol] + '"') +
+      ', answers.Sports = ' + JSON.stringify(answers.Sports),
+  );
+
   var payload = {
-    eventSlug: eventSlug,
     sourceForm: SpreadsheetApp.getActive().getId(),
     sourceSheet: sheet.getName(),
     sourceRow: row,
@@ -144,13 +157,16 @@ function post_(url, secret, payload) {
 
       if (code === 200) {
         var text = '✅ Received · ' + body.memberCount + ' member(s)';
+        if (body.events && body.events.length) text += ' · ' + body.events.join(', ');
         if (body.warnings && body.warnings.length) text += ' · ⚠ ' + body.warnings.join(' | ');
         return text;
       }
       if (code === 401) return '❌ Webhook secret mismatch. Ask the tech team.';
       if (code === 404) return '⚠ Not synced (HTTP 404: check the WEBHOOK_URL script property). Use Infinito → Resync unsent rows.';
       if (code === 400 || code === 409 || code === 422) {
-        return '❌ ' + (body.errors || ['HTTP ' + code]).join(' | ');
+        var problem = '❌ ' + (body.errors || ['HTTP ' + code]).join(' | ');
+        if (!('Sports' in payload.answers)) problem += ' (no Sports/Sport/Event/Game column found in this sheet)';
+        return problem;
       }
       lastProblem = 'HTTP ' + code; // 5xx / 503 retryable, or server waking up
     } catch (err) {
@@ -161,6 +177,32 @@ function post_(url, secret, payload) {
   return '⚠ Not synced (' + lastProblem + '). Use Infinito → Resync unsent rows.';
 }
 
+/** Lowercase, single spaces, no invisible characters, no trailing "*", ":", "." or "?". */
+function normalizeHeader_(header) {
+  return String(header || '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[\s\u00A0]+/g, ' ')
+    .trim()
+    .replace(/[\s*:.?]+$/, '')
+    .toLowerCase();
+}
+
+/**
+ * 0-based index of the sport column: an exact match of Sports / Sport / Event / Game
+ * (normalised), else a header starting with "sport" (e.g. "Sports (TT, Hockey, ...)"); -1 if none.
+ */
+function findSportColumn_(headers) {
+  var normalized = headers.map(normalizeHeader_);
+  for (var i = 0; i < SPORT_HEADERS.length; i++) {
+    var exact = normalized.indexOf(SPORT_HEADERS[i]);
+    if (exact !== -1) return exact;
+  }
+  for (var j = 0; j < normalized.length; j++) {
+    if (normalized[j].indexOf('sport') === 0) return j;
+  }
+  return -1;
+}
+
 /** Accepts the full endpoint or just the server's base URL. */
 function normalizeWebhookUrl_(raw) {
   var url = String(raw || '').trim().replace(/\/+$/, '');
@@ -168,8 +210,21 @@ function normalizeWebhookUrl_(raw) {
   return url.slice(-WEBHOOK_PATH.length) === WEBHOOK_PATH ? url : url + WEBHOOK_PATH;
 }
 
+/** Date check that doesn't depend on which Date constructor created the value. */
+function isDate_(value) {
+  return Object.prototype.toString.call(value) === '[object Date]';
+}
+
 function formatCell_(value) {
-  if (value instanceof Date) return value.toISOString();
+  if (isDate_(value)) {
+    // Date-only answers (e.g. "Check In Date") are sent as yyyy-MM-dd in the sheet's own
+    // timezone, so the planned date can't shift by a day; real date-times stay ISO.
+    var tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+    if (Utilities.formatDate(value, tz, 'HH:mm:ss') === '00:00:00') {
+      return Utilities.formatDate(value, tz, 'yyyy-MM-dd');
+    }
+    return value.toISOString();
+  }
   if (value === null || value === undefined) return '';
   return String(value);
 }

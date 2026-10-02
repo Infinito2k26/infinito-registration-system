@@ -31,6 +31,7 @@ export interface QrEmailSummary {
   queued: { sendAt: Date } | null;
   lastFailure: string | null;
   manualResendsUsed: number;
+  /** 0 = unlimited. */
   manualResendLimit: number;
 }
 
@@ -74,8 +75,14 @@ export class QrEmailService {
     return revived.count + created > 0;
   }
 
-  /** Staff-initiated resend, capped at QR_MANUAL_RESEND_LIMIT per registration. */
-  async resend(registrationId: string, actorId: string): Promise<void> {
+  /**
+   * Staff-initiated send/resend of a participant's own pass to their CURRENT email, reusing
+   * the same QR token. Unlimited unless QR_MANUAL_RESEND_LIMIT > 0. Only one QR email per
+   * participant can be queued at a time (stops double clicks; the next send is allowed as
+   * soon as the previous one has been handed to the provider or has failed).
+   */
+  async resend(registrationId: string, actorId: string): Promise<{ toEmail: string; manualSends: number }> {
+    let result: { toEmail: string; manualSends: number } = { toEmail: '', manualSends: 0 };
     await this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'qr-resend:' + registrationId}))`;
       const reg = await tx.registration.findUnique({
@@ -84,7 +91,7 @@ export class QrEmailService {
       });
       if (!reg) throw new QrEmailError('Registration not found');
       if (reg.paymentStatus !== PaymentStatus.VERIFIED || !reg.person.qrToken) {
-        throw new QrEmailError('Payment is not verified, so there is no pass to send');
+        throw new QrEmailError('Not verified, so there is no pass to send');
       }
 
       const qrRows = await tx.emailOutbox.findMany({
@@ -97,8 +104,8 @@ export class QrEmailService {
       const resends = qrRows.filter((r) => r.idempotencyKey.startsWith(resendKeyPrefix(registrationId)));
       const used = resends.filter((r) => r.status !== EmailStatus.CANCELLED).length;
       const limit = this.config.qrManualResendLimit;
-      if (used >= limit) {
-        throw new QrEmailError(`Resend limit reached (${limit} manual resends per participant per event)`);
+      if (limit > 0 && used >= limit) {
+        throw new QrEmailError(`Resend limit reached (${limit} manual sends per participant per event)`);
       }
 
       const attempt = resends.length + 1;
@@ -117,11 +124,13 @@ export class QrEmailService {
           registrationId,
           type: ActivityType.QR_EMAIL_RESENT,
           actorId,
-          details: { resend: used + 1, limit, toEmail: reg.person.email },
+          details: { resend: used + 1, limit: limit || null, toEmail: reg.person.email, result: 'queued' },
         },
       ]);
+      result = { toEmail: reg.person.email, manualSends: used + 1 };
     });
     this.worker.kick();
+    return result;
   }
 
   async summaries(registrationIds: string[]): Promise<Map<string, QrEmailSummary>> {
@@ -138,7 +147,7 @@ export class QrEmailService {
         (acc, r) => (!acc || (r.sentAt ?? 0) > (acc.sentAt ?? 0) ? r : acc),
         null,
       );
-      const queued = mine.find((r) => r.status === EmailStatus.PENDING || r.status === EmailStatus.PROCESSING);
+      const queued = mine.find((r) => r.status === EmailStatus.PENDING || r.status === EmailStatus.PROCESSING) ?? null;
       const failed = [...mine].reverse().find((r) => r.status === EmailStatus.FAILED);
       result.set(id, {
         sentCount: sent.length,
@@ -155,7 +164,7 @@ export class QrEmailService {
     return result;
   }
 
-  private qrEmail(reg: RegistrationWithPerson, teamName: string) {
+  qrEmail(reg: RegistrationWithPerson, teamName: string) {
     const eventName = this.config.eventName(reg.eventSlug);
     return {
       toEmail: reg.person.email,
@@ -166,7 +175,9 @@ export class QrEmailService {
       payload: {
         name: reg.person.name ?? '',
         eventName,
-        team: teamName,
+        // Individual registrations are "teams" named after the person; don't repeat the name.
+        team: teamName && teamName !== reg.person.name ? teamName : null,
+        college: reg.person.college ?? null,
         qrUrl: qrPassUrl(this.config.baseUrl, reg.person.qrToken!),
       },
     };

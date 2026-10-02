@@ -49,17 +49,18 @@ describe('Infinito registration system (e2e)', () => {
     throttle.storage?.clear();
     throttle.hitExpirations?.clear();
     await prisma.$executeRawUnsafe(
-      'TRUNCATE "RegistrationActivity","EmailOutbox","EntryLog","Registration","TeamMember","Team","Person","StaffSession","StaffUser" CASCADE',
+      'TRUNCATE "RegistrationActivity","EmailOutbox","EmailBatch","EntryLog","Registration","TeamMember","Team","PersonEmailAlias","Person","College","StaffSession","StaffUser" CASCADE',
     );
   });
 
   // ---------- helpers ----------
 
-  const submit = (responseId: string, answers: Record<string, string>, eventSlug = 'football', secret = 'e2e-webhook-secret') =>
+  /** The event now comes only from the form's Sports answer; `sport` fills it in. */
+  const submit = (responseId: string, answers: Record<string, string>, sport = 'football', secret = 'e2e-webhook-secret') =>
     http
       .post('/webhooks/forms/submit')
       .set('X-Webhook-Secret', secret)
-      .send({ eventSlug, sourceForm: 'sheet-e2e', sourceRow: 2, responseId, answers });
+      .send({ sourceForm: 'sheet-e2e', sourceRow: 2, responseId, answers: { Sports: sport, ...answers } });
 
   const team2 = (txn = 'UTR111') => ({
     'Team Name': 'Byte Me',
@@ -132,11 +133,12 @@ describe('Infinito registration system (e2e)', () => {
       await submit('r1', team2(), 'football', 'wrong-secret').expect(401);
       await http.post('/webhooks/forms/submit').set('X-Webhook-Secret', 'e2e-webhook-secret').send({ eventSlug: 'Bad Slug!' }).expect(400);
       const invalid = await submit('r1', { 'Member 1 Name': 'A', 'Member 1 Email': 'not-an-email' }).expect(422);
-      expect(invalid.body.errors).toEqual(['Member 1: "not-an-email" is not a valid email', 'Transaction ID is missing']);
+      // No transaction ID needed: verification is a manual dashboard step.
+      expect(invalid.body.errors).toEqual(['Member 1: "not-an-email" is not a valid email']);
       expect(await prisma.person.count()).toBe(0);
     });
 
-    it('matches titles regardless of case, spacing, "*" and ":" and lowercases EVENT_SLUG', async () => {
+    it('matches titles regardless of case, spacing, "*" and ":" and slugifies the Sports answer', async () => {
       const res = await submit(
         'r1',
         {
@@ -311,7 +313,7 @@ describe('Infinito registration system (e2e)', () => {
       const detail = await getAs(coordinator, `/admin/teams/${await teamId('r1')}`).expect(200);
       expect(detail.text).toContain('asha@example.com');
       expect(detail.text).toContain('UTR111');
-      expect(detail.text).toContain('Submitted via form');
+      expect(detail.text).toContain('Imported from the form');
     });
   });
 
@@ -395,7 +397,7 @@ describe('Infinito registration system (e2e)', () => {
       const asha = await regOf('asha@example.com');
       await postAs(volunteer, `/p/${asha.person.qrToken}/enter`, { registrationId: asha.id }).expect(303);
       expect(flash(await postAs(coordinator, `/admin/teams/${id}/reject`, { remarks: 'late doubt' }))).toBe(
-        'A member of this team has already entered; payment can no longer be rejected',
+        'Already entered (checked in at least once); the registration can no longer be rejected',
       );
       expect((await regOf('asha@example.com')).paymentStatus).toBe(PaymentStatus.VERIFIED);
       expect(await prisma.entryLog.count({ where: { status: EntryStatus.ENTERED } })).toBe(1);
@@ -405,7 +407,9 @@ describe('Infinito registration system (e2e)', () => {
   // ---------- QR email + manual resend ----------
 
   describe('QR email resend', () => {
-    it('each member gets their own pass; resend reuses the token, respects the limit and is audited', async () => {
+    it('each member gets their own pass; resend reuses the token, respects a configured limit and is audited', async () => {
+      process.env.QR_MANUAL_RESEND_LIMIT = '2'; // optional cap; the default (0) is unlimited
+      try {
       const { id, coordinator } = await verifiedTeam();
       await worker.processBatch();
       const asha = await regOf('asha@example.com');
@@ -425,7 +429,7 @@ describe('Infinito registration system (e2e)', () => {
       expect(flash(await postAs(coordinator, `/admin/registrations/${asha.id}/resend-qr`))).toMatch(/^QR email queued/);
       await worker.processBatch();
       expect(flash(await postAs(coordinator, `/admin/registrations/${asha.id}/resend-qr`))).toBe(
-        'Resend limit reached (2 manual resends per participant per event)',
+        'Resend limit reached (2 manual sends per participant per event)',
       );
 
       const ashaRows = (await qrRows(id)).filter((r) => r.toEmail === 'asha@example.com');
@@ -437,8 +441,11 @@ describe('Infinito registration system (e2e)', () => {
       expect(await prisma.registrationActivity.count({ where: { registrationId: asha.id, type: 'QR_EMAIL_RESENT' } })).toBe(2);
 
       const page = await getAs(coordinator, `/admin/teams/${id}`).expect(200);
-      expect(page.text).toContain('Manual resends 2/2');
+      expect(page.text).toContain('Manual sends 2/2');
       expect(page.text).toContain('Sent <b>3</b>');
+      } finally {
+        process.env.QR_MANUAL_RESEND_LIMIT = '0';
+      }
     });
 
     it('a failed email can be retried with a manual resend (within the limit)', async () => {
@@ -457,11 +464,11 @@ describe('Infinito registration system (e2e)', () => {
       const coordinator = await staff(StaffRole.COORDINATOR);
       const asha = await regOf('asha@example.com');
       expect(flash(await postAs(coordinator, `/admin/registrations/${asha.id}/resend-qr`))).toBe(
-        'Payment is not verified, so there is no pass to send',
+        'Not verified, so there is no pass to send',
       );
       await postAs(coordinator, `/admin/teams/${await teamId('r1')}/reject`, { remarks: 'no payment' });
       expect(flash(await postAs(coordinator, `/admin/registrations/${asha.id}/resend-qr`))).toBe(
-        'Payment is not verified, so there is no pass to send',
+        'Not verified, so there is no pass to send',
       );
       expect(await prisma.emailOutbox.count({ where: { template: EmailTemplate.QrPass } })).toBe(0);
     });
@@ -502,7 +509,7 @@ describe('Infinito registration system (e2e)', () => {
       expect(messages.filter((m) => m?.startsWith('✅ ENTERED'))).toHaveLength(1);
       expect(messages.filter((m) => m?.startsWith('ALREADY ENTERED'))).toHaveLength(9);
       expect(await prisma.entryLog.count({ where: { status: EntryStatus.ENTERED } })).toBe(1);
-      expect(await prisma.entryLog.count({ where: { status: EntryStatus.REJECTED, notes: 'already entered' } })).toBe(9);
+      expect(await prisma.entryLog.count({ where: { status: EntryStatus.REJECTED, notes: 'already inside' } })).toBe(9);
 
       const repeat = await getAs(volunteer, `/p/${asha.person.qrToken}`).expect(200);
       expect(repeat.text).toContain('ALREADY ENTERED');
@@ -520,7 +527,7 @@ describe('Infinito registration system (e2e)', () => {
       const volunteer = await staff(StaffRole.VOLUNTEER);
       // Ravi's registration with Asha's pass token
       expect(flash(await postAs(volunteer, `/p/${asha.person.qrToken}/enter`, { registrationId: ravi.id }))).toBe(
-        'Registration not found for this pass',
+        'INVALID QR: registration not found for this pass',
       );
       const anon = await http.post(`/p/${asha.person.qrToken}/enter`).type('form').send({ registrationId: asha.id }).expect(303);
       expect(anon.headers.location).toMatch(/^\/login/);

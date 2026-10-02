@@ -1,6 +1,7 @@
 import { Global, Injectable, Logger, Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
+import { parseAadhaarKey } from '../registrations/aadhaar-crypto';
 
 /** Typed access to environment settings, with the defaults documented in .env.example. */
 @Injectable()
@@ -60,9 +61,12 @@ export class AppConfig {
     return this.num('DECISION_EMAIL_DELAY_SECONDS', 120);
   }
 
-  /** Manual "Resend QR email" clicks allowed per registration (the initial send is not counted). */
+  /**
+   * Manual "Send/Resend QR email" clicks allowed per registration (the automatic email on
+   * verification is not counted). 0 = unlimited (default).
+   */
   get qrManualResendLimit() {
-    return this.num('QR_MANUAL_RESEND_LIMIT', 3);
+    return Math.max(0, this.num('QR_MANUAL_RESEND_LIMIT', 0));
   }
 
   get bootstrapAdminEmails(): string[] {
@@ -106,6 +110,19 @@ export class AppConfig {
     return problems;
   }
 
+  private aadhaarKeyCache: Buffer | null | undefined;
+
+  /** AES-256 key for full Aadhaar numbers (AADHAAR_ENCRYPTION_KEY); null = store last 4 only. */
+  get aadhaarKey(): Buffer | null {
+    if (this.aadhaarKeyCache === undefined) this.aadhaarKeyCache = parseAadhaarKey(this.str('AADHAAR_ENCRYPTION_KEY'));
+    return this.aadhaarKeyCache;
+  }
+
+  /** Whether volunteers may verify registrations from the gate card (default: no). */
+  get volunteersCanVerify() {
+    return this.str('VOLUNTEERS_CAN_VERIFY') === 'true';
+  }
+
   /** Service-account JSON (raw or base64) with read access to the form upload folders. */
   get googleServiceAccountJson() {
     const raw = this.str('GOOGLE_SERVICE_ACCOUNT_JSON');
@@ -130,7 +147,8 @@ export class AppConfig {
       this.eventNames[slug] ??
       slug
         .split('-')
-        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        // Very short words are usually abbreviations: "tt" -> "TT", "e-sports" -> "E Sports".
+        .map((w) => (w.length <= 2 ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1)))
         .join(' ')
     );
   }

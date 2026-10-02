@@ -1,14 +1,30 @@
-import { ActivityType, EmailDeliveryStatus, EmailStatus, PaymentStatus } from '@prisma/client';
+import { ActivityType, EmailDeliveryStatus, EmailStatus, EntryKind, PaymentStatus } from '@prisma/client';
+import { CollegeEmailService } from '../emails/college-email.service';
 import { EmailTemplate } from '../emails/email-templates';
+import { formatAadhaar, maskAadhaar } from '../registrations/aadhaar-crypto';
 import { QrEmailSummary } from '../emails/qr-email.service';
 import { SafeHtml, html } from '../web/html';
-import { BadgeTone, badge, csrfField, fmtDate, paymentBadge } from '../web/layout';
-import { AdminQueryService, PAGE_SIZE, TeamFilters, teamPaymentState } from './admin-query.service';
+import { BadgeTone, badge, csrfField, fmtDate, fmtDay, fmtExact, paymentBadge } from '../web/layout';
+import {
+  AdminQueryService,
+  CollegeRow,
+  Counters,
+  ExpectedKind,
+  ExpectedSummary,
+  PAGE_SIZE,
+  RegistrationFilters,
+  RegistrationView,
+  teamPaymentState,
+} from './admin-query.service';
 
 type EventSummary = Awaited<ReturnType<AdminQueryService['eventSummary']>>;
-type TeamList = Awaited<ReturnType<AdminQueryService['listTeams']>>;
+type RegistrationList = Awaited<ReturnType<AdminQueryService['listRegistrations']>>;
 type TeamDetail = NonNullable<Awaited<ReturnType<AdminQueryService['teamDetail']>>>;
+type ParticipantDetail = NonNullable<Awaited<ReturnType<AdminQueryService['participantDetail']>>>;
+type CollegeDetail = NonNullable<Awaited<ReturnType<AdminQueryService['collegeParticipants']>>>;
+type Batches = Awaited<ReturnType<CollegeEmailService['batches']>>;
 type EntryList = Awaited<ReturnType<AdminQueryService['entries']>>;
+type ExpectedList = Awaited<ReturnType<AdminQueryService['expected']>>;
 type EventName = (slug: string) => string;
 
 const who = (u: { name: string | null; email: string } | null | undefined) => (u ? u.name || u.email : 'system');
@@ -30,14 +46,55 @@ function pager(base: Record<string, string | undefined>, page: number, total: nu
   </nav>`;
 }
 
-export function eventSidebar(events: EventSummary, current: string | undefined, eventName: EventName, path: string) {
+/**
+ * TOTAL / VERIFIED / PENDING / REJECTED / BLOCKED / INSIDE / OUTSIDE (see Counters for definitions).
+ * With `link`, every tile is a filter (TOTAL = all) and the active one is highlighted.
+ */
+export function countersBar(
+  c: Counters,
+  link?: { href: (view: RegistrationView | undefined) => string; active: RegistrationView | undefined },
+) {
+  const item = (label: string, value: number, view: RegistrationView | undefined, tone = '', title = '') => {
+    const inner = html`<div class="label">${label}</div><div class="value">${value}</div>`;
+    if (!link) return html`<div class="counter ${tone}" title="${title}">${inner}</div>`;
+    const active = link.active === view;
+    return html`<a class="counter ${tone} ${active ? 'active' : ''}" title="${title}" href="${link.href(view)}" ${active ? html`aria-current="true"` : null}>${inner}</a>`;
+  };
+  return html`<div class="counters">
+    ${item('Total', c.total, undefined, '', 'All registrations (one per participant per event)')}
+    ${item('Verified', c.verified, 'VERIFIED', 'ok', 'Manually verified by a coordinator/admin')}
+    ${item('Pending', c.pending, 'PENDING', 'warn', 'Not yet verified')}
+    ${item('Rejected', c.rejected, 'REJECTED', '', 'Rejected during verification')}
+    ${item('Blocked', c.blocked, 'BLOCKED', c.blocked ? 'bad' : '', 'Participant blocked at the gate (cannot check in or out)')}
+    ${item('Inside', c.inside, 'INSIDE', 'info', 'Checked in and not checked out since')}
+    ${item('Outside', c.outside, 'OUTSIDE', '', 'Not currently inside (never checked in, or checked out)')}
+  </div>`;
+}
+
+const blockedBadge = (p: { blockedAt: Date | null }) => (p.blockedAt ? badge('BLOCKED', 'bad') : null);
+
+/** "YYYY-MM-DD" for <input type="date"> from a DATE column value. */
+const isoDay = (d: Date | undefined) => (d ? d.toISOString().slice(0, 10) : '');
+
+function presenceBadge(r: { insideSince: Date | null; enteredAt?: Date | null }) {
+  if (r.insideSince) return badge('Inside', 'ok');
+  return r.enteredAt ? badge('Outside (checked out)', 'muted') : badge('Outside', 'muted');
+}
+
+export function eventSidebar(
+  events: EventSummary,
+  current: string | undefined,
+  eventName: EventName,
+  path: string,
+  keep: Record<string, string | undefined> = {},
+) {
   const all = events.reduce((n, e) => n + e.teams, 0);
   const allPending = events.reduce((n, e) => n + e.pendingTeams, 0);
   return html`<aside class="events">
     <h2>Events</h2>
-    <a href="${path}" class="${!current ? 'active' : ''}">All events <span class="count">${all}</span>${allPending ? html`<span class="pending">${allPending}</span>` : null}</a>
+    <a href="${path}${buildQuery(keep)}" class="${!current ? 'active' : ''}">All events <span class="count">${all}</span>${allPending ? html`<span class="pending">${allPending}</span>` : null}</a>
     ${events.map(
-      (e) => html`<a href="${path}${buildQuery({ event: e.slug })}" class="${current === e.slug ? 'active' : ''}">
+      (e) => html`<a href="${path}${buildQuery({ ...keep, event: e.slug })}" class="${current === e.slug ? 'active' : ''}">
         ${eventName(e.slug)} <span class="count">${e.teams}</span>${e.pendingTeams ? html`<span class="pending" title="Awaiting verification">${e.pendingTeams}</span>` : null}
       </a>`,
     )}
@@ -45,59 +102,98 @@ export function eventSidebar(events: EventSummary, current: string | undefined, 
   </aside>`;
 }
 
+const VIEW_LABEL: Record<RegistrationView, string> = {
+  PENDING: 'Pending',
+  VERIFIED: 'Verified',
+  REJECTED: 'Rejected',
+  BLOCKED: 'Blocked',
+  INSIDE: 'Inside',
+  OUTSIDE: 'Outside',
+};
+
+/** One row per registration; every row opens the participant page. */
 export function registrationsPage(args: {
-  filters: TeamFilters;
-  list: TeamList;
+  filters: RegistrationFilters;
+  list: RegistrationList;
   events: EventSummary;
+  collegeName?: string;
   eventName: EventName;
 }): SafeHtml {
   const { filters, list, events, eventName } = args;
-  const current = events.find((e) => e.slug === filters.event);
-  const base = { event: filters.event, q: filters.q, status: filters.status };
-  const chip = (status: PaymentStatus | undefined, label: string, count: number) =>
-    html`<a class="chip ${filters.status === status ? 'active' : ''}" href="/admin/registrations${buildQuery({ ...base, status, page: undefined })}">${label} <b>${count}</b></a>`;
+  const base = {
+    event: filters.event,
+    college: filters.college,
+    q: filters.q,
+    arrival: isoDay(filters.arrival) || undefined,
+    departure: isoDay(filters.departure) || undefined,
+  };
+  const href = (view: RegistrationView | undefined) =>
+    `/admin/registrations${buildQuery({ ...base, status: view?.toLowerCase() })}`;
+  const c = list.counters;
+  const counts: Record<RegistrationView, number> = {
+    PENDING: c.pending,
+    VERIFIED: c.verified,
+    REJECTED: c.rejected,
+    BLOCKED: c.blocked,
+    INSIDE: c.inside,
+    OUTSIDE: c.outside,
+  };
+  const chip = (view: RegistrationView | undefined, label: string, count: number) =>
+    html`<a class="chip ${filters.view === view ? 'active' : ''}" href="${href(view)}" ${filters.view === view ? html`aria-current="true"` : null}>${label} <b>${count}</b></a>`;
+  const empty =
+    list.total > 0
+      ? null
+      : filters.view && c.total > 0
+        ? html`No registrations are <b>${VIEW_LABEL[filters.view].toLowerCase()}</b> under these filters. ${c.total} registration(s) match otherwise: <a href="${href(undefined)}">show all</a>.`
+        : 'No registrations match.';
 
   return html`<div class="with-sidebar">
-    ${eventSidebar(events, filters.event, eventName, '/admin/registrations')}
+    ${eventSidebar(events, filters.event, eventName, '/admin/registrations', { college: filters.college })}
     <div class="content">
-      <h1>${filters.event ? eventName(filters.event) : 'All registrations'}</h1>
-      ${current ? html`<p class="muted">${current.teams} teams · ${current.participants} participants · ${current.entered} entered</p>` : null}
+      <h1>${filters.event ? eventName(filters.event) : 'All registrations'}${filters.view ? html` <span class="muted">· ${VIEW_LABEL[filters.view]}</span>` : null}</h1>
+      ${args.collegeName ? html`<p>College: <b>${args.collegeName}</b> · <a href="/admin/registrations${buildQuery({ event: filters.event })}">all colleges</a> · <a href="/admin/colleges/${filters.college}${buildQuery({ event: filters.event })}">college page</a></p>` : null}
+      ${countersBar(c, { href, active: filters.view })}
       <form method="get" action="/admin/registrations" class="row-form search">
         ${filters.event ? html`<input type="hidden" name="event" value="${filters.event}">` : null}
-        ${filters.status ? html`<input type="hidden" name="status" value="${filters.status}">` : null}
-        <input type="search" name="q" value="${filters.q ?? ''}" placeholder="Name, email, team, transaction ID or registration ID">
+        ${filters.college ? html`<input type="hidden" name="college" value="${filters.college}">` : null}
+        ${filters.view ? html`<input type="hidden" name="status" value="${filters.view.toLowerCase()}">` : null}
+        <input type="search" name="q" value="${filters.q ?? ''}" placeholder="Name, email, mobile, roll no., college, team or registration ID">
+        <label class="small">Expected arrival <input type="date" name="arrival" value="${isoDay(filters.arrival)}"></label>
+        <label class="small">Expected departure <input type="date" name="departure" value="${isoDay(filters.departure)}"></label>
         <button>Search</button>
-        ${filters.q ? html`<a href="/admin/registrations${buildQuery({ event: filters.event, status: filters.status })}">Clear</a>` : null}
+        ${filters.q || filters.arrival || filters.departure ? html`<a href="/admin/registrations${buildQuery({ event: filters.event, college: filters.college, status: filters.view?.toLowerCase() })}">Clear</a>` : null}
       </form>
       <div class="chips">
-        ${chip(undefined, 'All', list.statusCounts.all)}
-        ${chip(PaymentStatus.PENDING, 'Pending', list.statusCounts.PENDING)}
-        ${chip(PaymentStatus.VERIFIED, 'Verified', list.statusCounts.VERIFIED)}
-        ${chip(PaymentStatus.REJECTED, 'Rejected', list.statusCounts.REJECTED)}
+        ${chip(undefined, 'All', c.total)}
+        ${(Object.keys(VIEW_LABEL) as RegistrationView[]).map((v) => chip(v, VIEW_LABEL[v], counts[v]))}
       </div>
       <div class="table-wrap">
-      <table class="table">
-        <thead><tr><th>Team</th>${filters.event ? null : html`<th>Event</th>`}<th>Captain</th><th>Members</th><th>Transaction ID</th><th>Payment</th><th>Submitted</th></tr></thead>
+      <table class="table rows-clickable">
+        <thead><tr><th>Participant</th>${filters.event ? null : html`<th>Event</th>`}<th>College</th><th>Contact</th><th>Status</th><th>Gate</th><th>Registered</th></tr></thead>
         <tbody>
-          ${list.teams.map((t) => {
-            const txn = t.registrations.find((r) => r.transactionId)?.transactionId;
-            const entered = t.registrations.filter((r) => r.enteredAt).length;
-            const captain = t.registrations.find((r) => r.person.email === t.captainEmail) ?? t.registrations[0];
-            return html`<tr>
-              <td><a href="/admin/teams/${t.id}">${t.name}</a></td>
-              ${filters.event ? null : html`<td>${eventName(t.eventSlug)}</td>`}
-              <td>${captain?.person.name}<br><span class="muted small">${captain?.person.email}</span></td>
-              <td>${t.registrations.length}${entered ? html` <span class="muted small">(${entered} in)</span>` : null}</td>
-              <td class="mono">${txn ?? html`<span class="muted">none</span>`}${txn && list.duplicateTxns.has(txn) ? html` ${badge('Duplicate', 'bad')}` : null}</td>
-              <td>${paymentBadge(teamPaymentState(t.registrations))}</td>
-              <td class="small">${fmtDate(t.createdAt)}</td>
+          ${list.registrations.map((r) => {
+            const team = r.team && r.team._count.registrations > 1 ? r.team : null;
+            return html`<tr data-href="/admin/registrations/${r.id}">
+              <td><a href="/admin/registrations/${r.id}">${r.person.name ?? r.person.email}</a>${
+                team
+                  ? html`<br><span class="small">team <a href="/admin/teams/${team.id}">${team.name}</a> (${team._count.registrations})</span>`
+                  : r.team && r.team.name !== r.person.name
+                    ? html` <span class="muted small">(${r.team.name})</span>`
+                    : null
+              }${r.transactionId ? html`<br><span class="mono small">${r.transactionId}</span>${list.duplicateTxns.has(r.transactionId) ? html` ${badge('Duplicate txn', 'bad')}` : null}` : null}</td>
+              ${filters.event ? null : html`<td>${eventName(r.eventSlug)}</td>`}
+              <td class="small">${r.person.collegeId ? html`<a href="/admin/colleges/${r.person.collegeId}">${r.person.college}</a>` : r.person.college}</td>
+              <td class="small">${r.person.email}${r.person.phone ? html`<br>${r.person.phone}` : null}</td>
+              <td>${paymentBadge(r.paymentStatus)} ${blockedBadge(r.person)}</td>
+              <td>${presenceBadge(r)}</td>
+              <td class="small">${fmtDate(r.createdAt)}</td>
             </tr>`;
           })}
-          ${list.teams.length === 0 ? html`<tr><td colspan="7" class="muted center">No registrations match.</td></tr>` : null}
+          ${empty ? html`<tr><td colspan="7" class="muted center">${empty}</td></tr>` : null}
         </tbody>
       </table>
       </div>
-      ${pager(base, filters.page, list.total, '/admin/registrations')}
+      ${pager({ ...base, status: filters.view?.toLowerCase() }, filters.page, list.total, '/admin/registrations')}
     </div>
   </div>`;
 }
@@ -123,51 +219,111 @@ function deliveryBadge(status: EmailStatus, delivery: EmailDeliveryStatus | null
   return badge(status === 'PENDING' ? 'queued' : status.toLowerCase(), tone[status]);
 }
 
-function qrCell(
-  reg: TeamDetail['team']['registrations'][number],
-  summary: QrEmailSummary | undefined,
-  csrf: string,
-) {
+/** QR email status + the individual Send/Resend button (one participant, their email, their QR). */
+function qrCell(reg: { id: string; paymentStatus: PaymentStatus }, summary: QrEmailSummary | undefined, csrf: string) {
   if (reg.paymentStatus !== PaymentStatus.VERIFIED || !summary) return html`<span class="muted small">after verification</span>`;
-  const canResend = !summary.queued && summary.manualResendsUsed < summary.manualResendLimit;
+  const unlimited = summary.manualResendLimit === 0;
+  const canSend = !summary.queued && (unlimited || summary.manualResendsUsed < summary.manualResendLimit);
   return html`<div class="small">
       <div>Sent <b>${summary.sentCount}</b>×${summary.lastSentAt ? html` · last ${fmtDate(summary.lastSentAt)}` : null}</div>
       ${summary.lastDeliveryStatus ? html`<div>${deliveryBadge(EmailStatus.SENT, summary.lastDeliveryStatus)}</div>` : null}
       ${summary.queued ? html`<div>${badge('queued', 'info')} sends ${fmtDate(summary.queued.sendAt)}</div>` : null}
       ${summary.lastFailure ? html`<div class="error-text">Failed: ${summary.lastFailure}</div>` : null}
-      <div class="muted">Manual resends ${summary.manualResendsUsed}/${summary.manualResendLimit}</div>
+      <div class="muted">Manual sends ${summary.manualResendsUsed}${unlimited ? ' (no limit)' : `/${summary.manualResendLimit}`}</div>
     </div>
     ${
-      canResend
-        ? html`<form method="post" action="/admin/registrations/${reg.id}/resend-qr" class="inline">${csrfField(csrf)}<button class="small">Resend QR email</button></form>`
+      canSend
+        ? html`<form method="post" action="/admin/registrations/${reg.id}/resend-qr" class="inline">${csrfField(csrf)}<button class="small">${summary.sentCount ? 'Resend QR email' : 'Send QR email'}</button></form>`
         : null
     }`;
 }
 
-function activityText(a: TeamDetail['activity'][number]): SafeHtml {
+function activityText(a: { type: ActivityType; details: unknown }): SafeHtml {
   const d = (a.details ?? {}) as Record<string, unknown>;
+  const str = (v: unknown) => (v === undefined || v === null ? '' : String(v));
   switch (a.type) {
     case ActivityType.SUBMITTED:
-      return html`Submitted via form${d.sourceRow ? ` (sheet row ${String(d.sourceRow)})` : ''}`;
+      return html`Imported from the form${d.sourceRow ? ` (sheet row ${str(d.sourceRow)})` : ''}${d.expectedArrival ? ` · expected arrival ${str(d.expectedArrival)}` : ''}${d.expectedDeparture ? ` · expected departure ${str(d.expectedDeparture)}` : ''}`;
     case ActivityType.UPDATED:
-      return html`Form response re-synced${d.movedFromTeamId ? ' · moved from another team' : ''}${d.transactionId !== undefined ? ` · txn now ${String(d.transactionId)}` : ''}${d.paymentResetFromRejected ? ' · back to pending' : ''}`;
+      return html`Form response re-synced${d.movedFromTeamId ? ' · moved from another response' : ''}${d.transactionId !== undefined ? ` · txn now ${str(d.transactionId)}` : ''}${d.paymentResetFromRejected ? ' · back to pending' : ''}${d.expectedArrival !== undefined ? ` · expected arrival now ${str(d.expectedArrival)}` : ''}${d.expectedDeparture !== undefined ? ` · expected departure now ${str(d.expectedDeparture)}` : ''}`;
     case ActivityType.PAYMENT_VERIFIED:
-      return html`<b>Payment verified</b>`;
+      return html`<b>Verified</b>${d.qrTokenCreated ? ' · QR pass created' : ''}`;
     case ActivityType.PAYMENT_REJECTED:
-      return html`<b>Payment rejected</b>: ${String(d.remarks ?? '')}`;
+      return html`<b>Rejected</b>: ${str(d.remarks)}`;
     case ActivityType.PAYMENT_UNVERIFIED:
       return html`Verification undone`;
     case ActivityType.QR_EMAIL_QUEUED:
-      return html`QR email queued`;
+      return html`QR email queued to ${str(d.toEmail)}`;
     case ActivityType.QR_EMAIL_RESENT:
-      return html`QR email resent manually (${String(d.resend)}/${String(d.limit)})`;
+      return html`QR email sent manually to ${str(d.toEmail)} (#${str(d.resend)}${d.limit ? `/${str(d.limit)}` : ''})`;
+    case ActivityType.QR_EMAIL_BULK_QUEUED:
+      return html`QR email queued to ${str(d.toEmail)} by a college bulk send`;
+    case ActivityType.QR_PASSES_FORWARDED:
+      return html`Pass included in a college email to ${str(d.recipientEmail)} (${str(d.passes)} passes)`;
+    case ActivityType.EMAIL_CHANGED:
+      return html`<b>Email changed</b> ${str(d.from)} → ${str(d.to)}`;
     case ActivityType.ENTERED:
-      return html`<b>Entered</b>${d.gate ? ` at ${String(d.gate)}` : ''}`;
+      return html`<b>Checked in</b>${d.gate ? ` at ${str(d.gate)}` : ''}`;
     case ActivityType.ENTRY_DENIED:
-      return html`Entry refused: ${String(d.reason ?? '')}${d.gate ? ` (${String(d.gate)})` : ''}`;
+      return html`Check-in refused: ${str(d.reason)}${d.gate ? ` (${str(d.gate)})` : ''}`;
+    case ActivityType.CHECKED_OUT:
+      return html`<b>Checked out</b>${d.gate ? ` at ${str(d.gate)}` : ''}${d.adminOverride ? ' (admin override while blocked)' : ''}`;
+    case ActivityType.BLOCKED:
+      return html`<b>Blocked</b>${d.reason ? `: ${str(d.reason)}` : ''}${d.wasInside ? ' (was inside)' : ''}`;
+    case ActivityType.UNBLOCKED:
+      return html`<b>Unblocked</b>${d.previousReason ? ` (was: ${str(d.previousReason)})` : ''}`;
+    case ActivityType.CHECKOUT_DENIED:
+      return html`Check-out refused: ${str(d.reason)}`;
     default:
       return html`${String(a.type)}`;
   }
+}
+
+function emailsTable(emails: TeamDetail['emails']) {
+  if (!emails.length) return html`<p class="muted">No emails yet.</p>`;
+  return html`<div class="table-wrap"><table class="table small">
+    <thead><tr><th>Email</th><th>To</th><th>Status</th><th>Sent</th><th>Triggered by</th></tr></thead>
+    <tbody>${emails.map(
+      (e) => html`<tr>
+        <td>${e.template}${e.batchId ? html` ${badge('college', 'info')}` : null}</td><td>${e.toEmail}</td>
+        <td>${deliveryBadge(e.status, e.deliveryStatus)}${e.lastError && e.status !== EmailStatus.SENT ? html`<br><span class="error-text">${e.lastError}</span>` : null}</td>
+        <td>${fmtDate(e.sentAt) || (e.status === EmailStatus.PENDING ? html`<span class="muted">at ${fmtDate(e.sendAt)}</span>` : null)}</td>
+        <td>${e.triggeredBy ? who(e.triggeredBy) : html`<span class="muted">automatic</span>`}</td>
+      </tr>`,
+    )}</tbody></table></div>`;
+}
+
+/** Verify / Undo / Reject. Decisions apply to the whole response (a team of one for individual forms). */
+function verificationActions(args: {
+  actionBase: string;
+  state: PaymentStatus | 'MIXED';
+  members: number;
+  canUndo: boolean;
+  entered: boolean;
+  remarks: string | null;
+  verifiedClash: boolean;
+  csrf: string;
+}) {
+  const { actionBase, state, csrf } = args;
+  const scope = args.members > 1 ? ` (all ${args.members} members)` : '';
+  return html`<div class="actions">
+      ${
+        state !== PaymentStatus.VERIFIED
+          ? html`<form method="post" action="${actionBase}/verify" class="inline">${csrfField(csrf)}
+              <button class="primary" ${args.verifiedClash ? 'disabled' : ''}>Verify${scope}</button></form>`
+          : null
+      }
+      ${args.canUndo ? html`<form method="post" action="${actionBase}/undo" class="inline">${csrfField(csrf)}<button>Undo verification</button></form>` : null}
+    </div>
+    ${
+      !args.entered
+        ? html`<form method="post" action="${actionBase}/reject" class="stack reject">${csrfField(csrf)}
+            <label>Rejection reason (emailed to the participant)
+              <textarea name="remarks" required maxlength="500" rows="2">${state === PaymentStatus.REJECTED ? args.remarks : ''}</textarea></label>
+            <button class="danger">${state === PaymentStatus.REJECTED ? 'Update rejection' : `Reject${scope}`}</button>
+          </form>`
+        : null
+    }`;
 }
 
 export function teamPage(args: {
@@ -183,6 +339,7 @@ export function teamPage(args: {
   const regs = team.registrations;
   const state = teamPaymentState(regs);
   const entered = regs.filter((r) => r.enteredAt).length;
+  const inside = regs.filter((r) => r.insideSince).length;
   const lastReview = [...regs]
     .filter((r) => r.paymentReviewedAt)
     .sort((a, b) => b.paymentReviewedAt!.getTime() - a.paymentReviewedAt!.getTime())[0];
@@ -196,12 +353,12 @@ export function teamPage(args: {
   <div class="title-row">
     <h1>${team.name}</h1>${paymentBadge(state)}
   </div>
-  <p class="muted">${eventName(team.eventSlug)} · ${regs.length} member(s) · ${entered}/${regs.length} entered${entered === regs.length ? ' · team entered' : ''} · submitted ${fmtDate(team.createdAt)} · <span class="mono small">${team.id}</span></p>
+  <p class="muted">${eventName(team.eventSlug)} · ${regs.length} member(s) · ${entered}/${regs.length} entered${entered === regs.length ? ' · team entered' : ''} · ${inside} inside now · submitted ${fmtDate(team.createdAt)} · <span class="mono small">${team.id}</span></p>
 
   <section class="card">
-    <h2>Payment</h2>
+    <h2>Verification</h2>
     <dl class="facts">
-      <dt>Transaction ID</dt><dd class="mono">${txn ?? html`<span class="muted">none given</span>`}</dd>
+      ${txn ? html`<dt>Transaction ID</dt><dd class="mono">${txn}</dd>` : null}
       ${lastReview ? html`<dt>Last decision</dt><dd>${paymentBadge(lastReview.paymentStatus)} by ${who(lastReview.paymentReviewedBy)}, ${fmtDate(lastReview.paymentReviewedAt)}</dd>` : null}
       ${regs[0]?.paymentRemarks ? html`<dt>Rejection reason</dt><dd>${regs[0].paymentRemarks}</dd>` : null}
     </dl>
@@ -214,41 +371,28 @@ export function teamPage(args: {
             ${verifiedClash ? html`<p>It is already verified for another team, so this one cannot be verified.</p>` : null}</div>`
         : null
     }
-    <div class="actions">
-      ${
-        state !== PaymentStatus.VERIFIED
-          ? html`<form method="post" action="/admin/teams/${team.id}/verify" class="inline">${csrfField(csrf)}
-              <button class="primary" ${verifiedClash ? 'disabled' : ''}>Verify payment</button></form>`
-          : null
-      }
-      ${
-        canUndo
-          ? html`<form method="post" action="/admin/teams/${team.id}/undo" class="inline">${csrfField(csrf)}
-              <button>Undo verification</button></form>`
-          : null
-      }
-    </div>
-    ${
-      entered === 0
-        ? html`<form method="post" action="/admin/teams/${team.id}/reject" class="stack reject">${csrfField(csrf)}
-            <label>Rejection reason (sent to the captain)
-              <textarea name="remarks" required maxlength="500" rows="2" placeholder="e.g. Amount short by ₹200 / transaction ID not found in statement">${state === PaymentStatus.REJECTED ? regs[0]?.paymentRemarks : ''}</textarea></label>
-            <button class="danger">${state === PaymentStatus.REJECTED ? 'Update rejection' : 'Reject payment'}</button>
-          </form>`
-        : null
-    }
-    <p class="muted small">QR and payment-issue emails wait ${args.delaySeconds}s before sending, so a mis-click can be undone.</p>
+    ${verificationActions({
+      actionBase: `/admin/teams/${team.id}`,
+      state,
+      members: regs.length,
+      canUndo,
+      entered: entered > 0,
+      remarks: regs[0]?.paymentRemarks ?? null,
+      verifiedClash: Boolean(verifiedClash),
+      csrf,
+    })}
+    <p class="muted small">QR and rejection emails wait ${args.delaySeconds}s before sending, so a mis-click can be undone.</p>
   </section>
 
   <section class="card">
     <h2>Members</h2>
     <div class="table-wrap">
     <table class="table">
-      <thead><tr><th>Participant</th><th>Contact</th><th>Files</th><th>Payment</th><th>QR email</th><th>Entry</th></tr></thead>
+      <thead><tr><th>Participant</th><th>Contact</th><th>Files</th><th>Status</th><th>QR email</th><th>Gate</th></tr></thead>
       <tbody>
         ${regs.map(
           (r) => html`<tr>
-            <td><b>${r.person.name}</b>${r.person.email === team.captainEmail ? html` ${badge('Captain', 'info')}` : null}<br><span class="small">${r.person.college}</span><br><span class="mono small muted">${r.id}</span></td>
+            <td><a href="/admin/registrations/${r.id}"><b>${r.person.name}</b></a>${r.person.email === team.captainEmail && regs.length > 1 ? html` ${badge('Captain', 'info')}` : null}<br><span class="small">${r.person.college}</span><br><span class="mono small muted">${r.id}</span></td>
             <td class="small">${r.person.email}${r.person.emailBouncedAt ? html`<br>${badge('Email bounced', 'bad')} <span class="error-text">${r.person.emailBounceReason}</span>` : null}<br>${r.person.phone}</td>
             <td class="small">${
               driveEnabled
@@ -258,11 +402,7 @@ export function teamPage(args: {
             }</td>
             <td>${paymentBadge(r.paymentStatus)}</td>
             <td>${qrCell(r, qr.get(r.id), csrf)}</td>
-            <td class="small">${
-              r.enteredAt
-                ? html`${badge('Entered', 'ok')}<br>${fmtDate(r.enteredAt)} by ${who(r.enteredBy)}${r.entryLogs[0]?.gate ? html`<br>${r.entryLogs[0].gate}` : null}`
-                : html`<span class="muted">not yet</span>`
-            }</td>
+            <td class="small">${presenceBadge(r)}${r.enteredAt ? html`<br>first in ${fmtDate(r.enteredAt)} by ${who(r.enteredBy)}${r.entryLogs[0]?.gate ? html` (${r.entryLogs[0].gate})` : null}` : null}</td>
           </tr>`,
         )}
       </tbody>
@@ -272,20 +412,7 @@ export function teamPage(args: {
 
   <section class="card">
     <h2>Emails</h2>
-    ${
-      emails.length
-        ? html`<div class="table-wrap"><table class="table small">
-            <thead><tr><th>Email</th><th>To</th><th>Status</th><th>Sent</th><th>Triggered by</th></tr></thead>
-            <tbody>${emails.map(
-              (e) => html`<tr>
-                <td>${e.template}</td><td>${e.toEmail}</td>
-                <td>${deliveryBadge(e.status, e.deliveryStatus)}${e.lastError && e.status !== EmailStatus.SENT ? html`<br><span class="error-text">${e.lastError}</span>` : null}</td>
-                <td>${fmtDate(e.sentAt) || (e.status === EmailStatus.PENDING ? html`<span class="muted">at ${fmtDate(e.sendAt)}</span>` : null)}</td>
-                <td>${e.triggeredBy ? who(e.triggeredBy) : html`<span class="muted">automatic</span>`}</td>
-              </tr>`,
-            )}</tbody></table></div>`
-        : html`<p class="muted">No emails yet.</p>`
-    }
+    ${emailsTable(emails)}
   </section>
 
   <section class="card">
@@ -300,31 +427,315 @@ export function teamPage(args: {
   </section>`;
 }
 
+/** Individual participant (one registration): all form data, verification, email, QR, gate, history. */
+export function participantPage(args: {
+  detail: ParticipantDetail;
+  qr: QrEmailSummary | undefined;
+  csrf: string;
+  /** Only admins see the check-out override for blocked participants. */
+  isAdmin: boolean;
+  /** Decrypted full Aadhaar, passed ONLY for admins (null otherwise). */
+  aadhaarFull: string | null;
+  eventName: EventName;
+  driveEnabled: boolean;
+  delaySeconds: number;
+}): SafeHtml {
+  const { detail, csrf, eventName, driveEnabled } = args;
+  const { reg, activity, emails } = detail;
+  const p = reg.person;
+  const members = reg.team?.registrations.length ?? 1;
+  const qrSent = emails.some(
+    (e) => e.template === EmailTemplate.QrPass && (e.status === EmailStatus.SENT || e.status === EmailStatus.PROCESSING),
+  );
+  const file = (kind: 'photo' | 'id' | 'aadhaar', id: string | null, label: string) =>
+    !driveEnabled
+      ? html`<span class="muted">Drive not configured</span>`
+      : id
+        ? html`<a href="/staff/files/${p.id}/${kind}" target="_blank" rel="noopener">${label}</a>`
+        : html`<span class="muted">not uploaded</span>`;
+  const fact = (label: string, value: unknown) =>
+    value === null || value === undefined || value === '' ? null : html`<dt>${label}</dt><dd>${String(value)}</dd>`;
+  const gateForm = (path: 'check-in' | 'check-out', label: string, cls: string) =>
+    html`<form method="post" action="/admin/registrations/${reg.id}/${path}" class="inline">${csrfField(csrf)}
+      <input type="hidden" name="gate" value="Manual (participant page)"><button class="${cls}">${label}</button></form>`;
+
+  return html`<p class="small"><a href="/admin/registrations${buildQuery({ event: reg.eventSlug })}">← ${eventName(reg.eventSlug)}</a>
+    ${p.collegeRef ? html` · <a href="/admin/colleges/${p.collegeRef.id}${buildQuery({ event: reg.eventSlug })}">${p.collegeRef.name}</a>` : null}</p>
+  <div class="title-row">
+    <h1>${p.name ?? p.email}</h1>${paymentBadge(reg.paymentStatus)} ${blockedBadge(p)} ${presenceBadge(reg)}
+  </div>
+  <p class="muted">${eventName(reg.eventSlug)}${members > 1 && reg.team ? html` · team <a href="/admin/teams/${reg.team.id}">${reg.team.name}</a> (${members})` : null} · registered ${fmtDate(reg.createdAt)} · <span class="mono small">${reg.id}</span></p>
+  ${p.registrations.length > 1 ? html`<p class="small">Other events: ${p.registrations.filter((o) => o.id !== reg.id).map((o) => html`<a href="/admin/registrations/${o.id}">${eventName(o.eventSlug)}</a> `)}</p>` : null}
+
+  <section class="card">
+    <h2>Participant</h2>
+    <dl class="facts">
+      <dt>Email</dt><dd>${p.email}${p.emailBouncedAt ? html` ${badge('bounced', 'bad')} <span class="error-text">${p.emailBounceReason}</span>` : null}</dd>
+      ${fact('College', p.college)}
+      <dt>Sport / event</dt><dd>${eventName(reg.eventSlug)}</dd>
+      ${fact('Mobile', p.phone)}
+      ${fact('College roll no.', p.rollNumber)}
+      ${
+        args.aadhaarFull
+          ? html`<dt>Aadhaar</dt><dd class="mono">${formatAadhaar(args.aadhaarFull)} <span class="muted small">(admin only)</span></dd>`
+          : p.aadhaarLast4
+            ? html`<dt>Aadhaar</dt><dd class="mono">${maskAadhaar(p.aadhaarLast4)}</dd>`
+            : null
+      }
+      ${fact('Accommodation', reg.accommodation)}
+      ${fact('Accommodation period', reg.accommodationPeriod)}
+      <dt>Expected arrival</dt><dd>${reg.expectedArrivalDate ? fmtDay(reg.expectedArrivalDate) : html`<span class="muted">${reg.expectedArrivalText ? `"${reg.expectedArrivalText}" (not a date)` : 'not given'}</span>`} <span class="muted small">(planned, from the form)</span></dd>
+      <dt>Expected departure</dt><dd>${reg.expectedDepartureDate ? fmtDay(reg.expectedDepartureDate) : html`<span class="muted">${reg.expectedDepartureText ? `"${reg.expectedDepartureText}" (not a date)` : 'not given'}</span>`} <span class="muted small">(planned, from the form)</span></dd>
+      ${fact('Remark', reg.remark)}
+      ${fact('Transaction ID', reg.transactionId)}
+      <dt>Files</dt><dd>${file('photo', p.photoDriveId, 'Photo')} · ${file('id', p.idDocumentDriveId, 'College ID card')}${args.isAdmin ? html` · ${file('aadhaar', p.aadhaarDriveId, 'Aadhaar card')}` : null}</dd>
+    </dl>
+    <form method="post" action="/admin/registrations/${reg.id}/change-email" class="row-form">
+      ${csrfField(csrf)}
+      <label>Change email <input type="email" name="email" required placeholder="new@example.com"></label>
+      <button>Change email</button>
+    </form>
+    <p class="muted small">Keeps the same participant, QR pass and history. Nothing is emailed automatically; use Send QR email afterwards.</p>
+  </section>
+
+  <section class="card">
+    <h2>Verification</h2>
+    <dl class="facts">
+      <dt>Status</dt><dd>${paymentBadge(reg.paymentStatus)}${reg.paymentReviewedAt ? html` by ${who(reg.paymentReviewedBy)}, ${fmtDate(reg.paymentReviewedAt)}` : null}</dd>
+      ${fact('Rejection reason', reg.paymentRemarks)}
+      <dt>QR pass</dt><dd>${p.qrToken ? 'created' : html`<span class="muted">created on verification</span>`}</dd>
+    </dl>
+    ${reg.team
+      ? verificationActions({
+          actionBase: `/admin/registrations/${reg.id}`,
+          state: reg.paymentStatus,
+          members,
+          canUndo: reg.paymentStatus === PaymentStatus.VERIFIED && !qrSent && !reg.enteredAt,
+          entered: Boolean(reg.enteredAt),
+          remarks: reg.paymentRemarks,
+          verifiedClash: false,
+          csrf,
+        })
+      : null}
+    <p class="muted small">Verifying creates the QR pass (if needed) and emails it after ${args.delaySeconds}s.</p>
+  </section>
+
+  <section class="card">
+    <h2>QR email</h2>
+    ${qrCell(reg, args.qr, csrf)}
+  </section>
+
+  <section class="card">
+    <h2>Gate access</h2>
+    ${
+      p.blockedAt
+        ? html`<div class="warning"><b>BLOCKED</b> since ${fmtDate(p.blockedAt)} by ${who(p.blockedBy)}${p.blockReason ? html`<br>Reason: ${p.blockReason}` : null}<br>
+            <span class="small">The QR is refused for check-in and check-out at the gate (all events) until unblocked.</span></div>
+          <form method="post" action="/admin/registrations/${reg.id}/unblock" class="inline">${csrfField(csrf)}<button>Unblock participant</button></form>`
+        : html`<form method="post" action="/admin/registrations/${reg.id}/block" class="row-form">${csrfField(csrf)}
+            <label>Block reason (optional, internal) <input name="reason" maxlength="500" placeholder="e.g. Registration issue"></label>
+            <button class="danger">Block participant</button></form>
+          <p class="muted small">Blocking stops check-in and check-out with this QR for every event. Verification, QR and history are kept.</p>`
+    }
+  </section>
+
+  <section class="card">
+    <h2>Gate (actual IN / OUT)</h2>
+    <p class="muted small">CHECK IN / CHECK OUT here works without scanning the QR. It follows the same rules as a scan (verified, not blocked, current state) and is recorded as a manual action under your name.</p>
+    <dl class="facts">
+      <dt>Now</dt><dd>${presenceBadge(reg)}${reg.insideSince ? html` since ${fmtExact(reg.insideSince)}` : null}</dd>
+      <dt>Actual check-in</dt><dd>${reg.lastCheckInAt ? fmtExact(reg.lastCheckInAt) : html`<span class="muted">Not yet</span>`}${reg.enteredAt && reg.lastCheckInAt && reg.enteredAt.getTime() !== reg.lastCheckInAt.getTime() ? html` <span class="muted small">(first entry ${fmtExact(reg.enteredAt)})</span>` : null}</dd>
+      <dt>Actual check-out</dt><dd>${reg.lastCheckOutAt ? fmtExact(reg.lastCheckOutAt) : html`<span class="muted">Not yet</span>`}</dd>
+    </dl>
+    <div class="actions">
+      ${reg.paymentStatus === PaymentStatus.VERIFIED && !reg.insideSince && !p.blockedAt ? gateForm('check-in', 'CHECK IN', 'primary') : null}
+      ${reg.insideSince && !p.blockedAt ? gateForm('check-out', 'CHECK OUT', '') : null}
+      ${
+        reg.insideSince && p.blockedAt && args.isAdmin
+          ? html`<form method="post" action="/admin/registrations/${reg.id}/check-out-override" class="inline">${csrfField(csrf)}
+              <input type="hidden" name="gate" value="Admin override"><button class="danger">Admin override: record check-out</button></form>`
+          : null
+      }
+    </div>
+    ${
+      reg.entryLogs.length
+        ? html`<div class="table-wrap"><table class="table small"><thead><tr><th>Time</th><th>Action</th><th>Result</th><th>Gate</th><th>Staff</th></tr></thead><tbody>
+          ${reg.entryLogs.map(
+            (l) => html`<tr><td>${fmtExact(l.enteredAt)}</td><td>${l.kind === EntryKind.CHECK_IN ? 'IN' : 'OUT'}</td>
+              <td>${l.status === 'ENTERED' ? badge('ok', 'ok') : badge(`refused: ${l.notes ?? ''}`, 'bad')}</td><td>${l.gate}</td><td>${who(l.volunteer)}</td></tr>`,
+          )}</tbody></table></div>`
+        : null
+    }
+  </section>
+
+  <section class="card">
+    <h2>Emails</h2>
+    ${emailsTable(emails)}
+  </section>
+
+  <section class="card">
+    <h2>History</h2>
+    <ol class="timeline">
+      ${activity.map(
+        (a) => html`<li><span class="when">${fmtDate(a.createdAt)}</span><span>${activityText(a)}</span><span class="muted small">${who(a.actor)}</span></li>`,
+      )}
+    </ol>
+  </section>`;
+}
+
+export function collegesPage(args: {
+  colleges: CollegeRow[];
+  event?: string;
+  q?: string;
+  events: EventSummary;
+  eventName: EventName;
+}): SafeHtml {
+  const { colleges, event, q, eventName } = args;
+  const totals = colleges.reduce(
+    (t, c) => ({
+      total: t.total + c.total,
+      verified: t.verified + c.verified,
+      pending: t.pending + c.pending,
+      rejected: t.rejected + c.rejected,
+      blocked: t.blocked + c.blocked,
+      inside: t.inside + c.inside,
+      outside: t.outside + c.outside,
+    }),
+    { total: 0, verified: 0, pending: 0, rejected: 0, blocked: 0, inside: 0, outside: 0 },
+  );
+  return html`<div class="with-sidebar">
+    ${eventSidebar(args.events, event, eventName, '/admin/colleges')}
+    <div class="content">
+      <h1>Colleges${event ? html`: ${eventName(event)}` : null}</h1>
+      ${countersBar(totals)}
+      <form method="get" action="/admin/colleges" class="row-form search">
+        ${event ? html`<input type="hidden" name="event" value="${event}">` : null}
+        <input type="search" name="q" value="${q ?? ''}" placeholder="College name">
+        <button>Search</button>
+        ${q ? html`<a href="/admin/colleges${buildQuery({ event })}">Clear</a>` : null}
+      </form>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>College</th><th class="num">Total</th><th class="num">Verified</th><th class="num">Pending</th><th class="num">Inside</th><th class="num">Outside</th><th class="num">Blocked</th></tr></thead>
+        <tbody>
+          ${colleges.map(
+            (c) => html`<tr><td><a href="/admin/colleges/${c.id}${buildQuery({ event })}">${c.name}</a></td>
+              <td class="num">${c.total}</td><td class="num">${c.verified}</td><td class="num">${c.pending}</td><td class="num">${c.inside}</td><td class="num">${c.outside}</td><td class="num">${c.blocked}</td></tr>`,
+          )}
+          ${colleges.length === 0 ? html`<tr><td colspan="7" class="muted center">No colleges match.</td></tr>` : null}
+        </tbody>
+      </table></div>
+    </div>
+  </div>`;
+}
+
+export function collegePage(args: {
+  detail: CollegeDetail;
+  counters: Counters;
+  qr: Map<string, QrEmailSummary>;
+  batches: Batches;
+  event?: string;
+  csrf: string;
+  eventName: EventName;
+}): SafeHtml {
+  const { detail, event, csrf, eventName } = args;
+  const { college, registrations } = detail;
+  const eligible = registrations.filter((r) => r.paymentStatus === PaymentStatus.VERIFIED && r.person.qrToken);
+  const recipients = [...new Map(eligible.map((r) => [r.person.id, r.person])).values()];
+  const scope = event ? eventName(event) : 'all events';
+
+  return html`<p class="small"><a href="/admin/colleges${buildQuery({ event })}">← Colleges</a></p>
+  <h1>${college.name}</h1>
+  <div class="chips">
+    <a class="chip ${!event ? 'active' : ''}" href="/admin/colleges/${college.id}">All events</a>
+    ${detail.events.map((e) => html`<a class="chip ${event === e.slug ? 'active' : ''}" href="/admin/colleges/${college.id}${buildQuery({ event: e.slug })}">${eventName(e.slug)} <b>${e.count}</b></a>`)}
+  </div>
+  ${countersBar(args.counters)}
+  <p class="small"><a href="/admin/registrations${buildQuery({ college: college.id, event })}">Search / filter these registrations</a> ·
+    <a href="/admin/arrivals${buildQuery({ college: college.id, event })}">Expected arrivals</a> ·
+    <a href="/admin/departures${buildQuery({ college: college.id, event })}">Expected departures</a></p>
+
+  <section class="card bulk">
+    <div>
+      <h3>Send QR to all verified students</h3>
+      <p class="small muted">Each of the <b>${eligible.length}</b> verified registration(s) (${scope}) gets THEIR OWN pass at THEIR OWN email. Unverified and rejected students are excluded.</p>
+      <form method="post" action="/admin/colleges/${college.id}/send-each" class="inline">${csrfField(csrf)}
+        ${event ? html`<input type="hidden" name="event" value="${event}">` : null}
+        <button class="primary" ${eligible.length ? '' : 'disabled'}>Send QR to all verified students</button></form>
+    </div>
+    <div>
+      <h3>Send all college QR passes to one student</h3>
+      <p class="small muted">One email to the selected student containing every verified student's own pass (${scope}). Each QR still admits only its owner.</p>
+      <form method="post" action="/admin/colleges/${college.id}/send-to-one" class="row-form">${csrfField(csrf)}
+        ${event ? html`<input type="hidden" name="event" value="${event}">` : null}
+        <label>Recipient <select name="personId" required ${recipients.length ? '' : 'disabled'}>
+          <option value="">Choose a verified student…</option>
+          ${recipients.map((p) => html`<option value="${p.id}">${p.name ?? p.email} (${p.email})</option>`)}
+        </select></label>
+        <button ${recipients.length ? '' : 'disabled'}>Send all passes to this student</button>
+      </form>
+    </div>
+  </section>
+
+  ${
+    args.batches.length
+      ? html`<section class="card"><h2>College email runs</h2><div class="table-wrap"><table class="table small">
+        <thead><tr><th>When</th><th>Type</th><th>Event</th><th>Recipient</th><th class="num">Eligible</th><th class="num">Queued</th><th class="num">Sent</th><th class="num">Failed</th><th class="num">Waiting</th><th>By</th></tr></thead>
+        <tbody>${args.batches.map(
+          (b) => html`<tr><td>${fmtDate(b.createdAt)}</td>
+            <td>${b.kind === 'COLLEGE_EACH' ? 'Each student, own email' : 'All passes to one student'}</td>
+            <td>${b.eventSlug ? eventName(b.eventSlug) : 'all'}</td>
+            <td>${b.recipientEmail ? html`${b.recipientPerson?.name ?? ''} ${b.recipientEmail}` : html`<span class="muted">each student</span>`}</td>
+            <td class="num">${b.eligibleCount}</td><td class="num">${b.queuedCount}</td><td class="num">${b.sent}</td>
+            <td class="num">${b.failed ? html`<span class="error-text">${b.failed}</span>` : 0}</td><td class="num">${b.pending}</td>
+            <td>${who(b.triggeredBy)}</td></tr>`,
+        )}</tbody></table></div></section>`
+      : null
+  }
+
+  <section class="card">
+    <h2>Participants (${registrations.length})</h2>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Name</th>${event ? null : html`<th>Event</th>`}<th>Contact</th><th>Roll no.</th><th>Status</th><th>Gate</th><th>QR email</th></tr></thead>
+      <tbody>${registrations.map(
+        (r) => html`<tr>
+          <td><a href="/admin/registrations/${r.id}">${r.person.name ?? r.person.email}</a></td>
+          ${event ? null : html`<td>${eventName(r.eventSlug)}</td>`}
+          <td class="small">${r.person.email}<br>${r.person.phone}</td>
+          <td class="small">${r.person.rollNumber}</td>
+          <td>${paymentBadge(r.paymentStatus)} ${blockedBadge(r.person)}</td>
+          <td>${presenceBadge(r)}</td>
+          <td>${qrCell(r, args.qr.get(r.id), csrf)}</td>
+        </tr>`,
+      )}</tbody>
+    </table></div>
+  </section>`;
+}
+
 export function entriesPage(args: {
   event: string | undefined;
   page: number;
   list: EntryList;
-  events: Awaited<ReturnType<AdminQueryService['eventSummary']>>;
+  events: EventSummary;
+  counters: Counters;
   eventName: EventName;
 }): SafeHtml {
   const { event, page, list, events, eventName } = args;
-  const current = events.find((e) => e.slug === event);
   return html`<div class="with-sidebar">
     ${eventSidebar(events, event, eventName, '/admin/entries')}
     <div class="content">
-      <h1>Entries${event ? html`: ${eventName(event)}` : null}</h1>
-      ${current ? html`<p class="muted">${current.entered} of ${current.participants} participants entered</p>` : null}
+      <h1>Gate log${event ? html`: ${eventName(event)}` : null}</h1>
+      ${countersBar(args.counters)}
       <div class="table-wrap">
       <table class="table">
-        <thead><tr><th>Time</th><th>Participant</th><th>Team</th>${event ? null : html`<th>Event</th>`}<th>Result</th><th>Gate</th><th>Volunteer</th></tr></thead>
+        <thead><tr><th>Time</th><th>Participant</th>${event ? null : html`<th>Event</th>`}<th>Action</th><th>Result</th><th>Gate</th><th>Staff</th></tr></thead>
         <tbody>
           ${list.logs.map(
             (l) => html`<tr>
               <td class="small">${fmtDate(l.enteredAt)}</td>
-              <td>${l.person.name}<br><span class="muted small">${l.person.email}</span></td>
-              <td>${l.registration?.team ? html`<a href="/admin/teams/${l.registration.team.id}">${l.registration.team.name}</a>` : null}</td>
+              <td>${l.registrationId ? html`<a href="/admin/registrations/${l.registrationId}">${l.person.name}</a>` : l.person.name}<br><span class="muted small">${l.person.email}</span></td>
               ${event ? null : html`<td>${eventName(l.eventSlug)}</td>`}
-              <td>${l.status === 'ENTERED' ? badge('Entered', 'ok') : badge(`Refused: ${l.notes ?? ''}`, 'bad')}</td>
+              <td>${l.kind === EntryKind.CHECK_IN ? 'IN' : 'OUT'}</td>
+              <td>${l.status === 'ENTERED' ? badge(l.kind === EntryKind.CHECK_IN ? 'Checked in' : 'Checked out', 'ok') : badge(`Refused: ${l.notes ?? ''}`, 'bad')}</td>
               <td>${l.gate}</td>
               <td class="small">${who(l.volunteer)}</td>
             </tr>`,
@@ -338,3 +749,101 @@ export function entriesPage(args: {
   </div>`;
 }
 
+/**
+ * Expected arrivals/departures for one day. "Expected" = the participant's planned date from
+ * the form; the arrived / checked-out / inside columns come only from actual QR gate scans.
+ */
+export function expectedPage(args: {
+  kind: ExpectedKind;
+  day: Date;
+  today: string;
+  tomorrow: string;
+  list: ExpectedList;
+  event?: string;
+  college?: string;
+  events: EventSummary;
+  colleges: { id: string; name: string }[];
+  eventName: EventName;
+}): SafeHtml {
+  const { kind, day, list, event, college, eventName } = args;
+  const arrivals = kind === 'arrival';
+  const path = arrivals ? '/admin/arrivals' : '/admin/departures';
+  const iso = isoDay(day);
+  const title = arrivals ? 'Expected arrivals' : 'Expected departures';
+  const sum = (x: ExpectedSummary) =>
+    arrivals
+      ? [
+          ['Expected arrivals', x.expected],
+          ['Already arrived', x.arrived],
+          ['Not arrived yet', x.notArrived],
+          ['Blocked', x.blocked],
+        ]
+      : [
+          ['Expected departures', x.expected],
+          ['Checked out', x.checkedOut],
+          ['Still inside', x.stillInside],
+          ['Never arrived', x.notArrived],
+          ['Blocked', x.blocked],
+        ];
+  const keep = { event, college };
+  return html`<div class="chips">
+      <a class="chip ${arrivals ? 'active' : ''}" href="/admin/arrivals${buildQuery({ ...keep, date: iso })}">Expected arrivals</a>
+      <a class="chip ${arrivals ? '' : 'active'}" href="/admin/departures${buildQuery({ ...keep, date: iso })}">Expected departures</a>
+    </div>
+    <h1>${title}: ${fmtDay(day)}</h1>
+    <p class="muted small">"Expected" is the participant's planned date from the form (${arrivals ? 'Check In Date' : 'Check Out Date'}).
+      ${arrivals ? 'Arrived = checked in with the QR at least once.' : 'Checked out / still inside = actual QR gate scans.'}</p>
+    <form method="get" action="${path}" class="row-form">
+      <label>Date <input type="date" name="date" value="${iso}" required></label>
+      <label>Event <select name="event"><option value="">All events</option>
+        ${args.events.map((e) => html`<option value="${e.slug}" ${e.slug === event ? 'selected' : ''}>${eventName(e.slug)}</option>`)}</select></label>
+      <label>College <select name="college"><option value="">All colleges</option>
+        ${args.colleges.map((c) => html`<option value="${c.id}" ${c.id === college ? 'selected' : ''}>${c.name}</option>`)}</select></label>
+      <button>Show</button>
+      <a href="${path}${buildQuery({ ...keep, date: args.today })}">Today</a>
+      <a href="${path}${buildQuery({ ...keep, date: args.tomorrow })}">Tomorrow</a>
+    </form>
+    <div class="counters">${sum(list.summary).map(
+      ([label, value]) => html`<div class="counter"><div class="label">${label}</div><div class="value">${value}</div></div>`,
+    )}</div>
+
+    ${
+      list.colleges.length > 1
+        ? html`<section class="card"><h2>By college</h2><div class="table-wrap"><table class="table small">
+          <thead><tr><th>College</th>${sum(list.summary).map(([label]) => html`<th class="num">${label}</th>`)}</tr></thead>
+          <tbody>${list.colleges.map(
+            (c) => html`<tr><td>${c.id ? html`<a href="${path}${buildQuery({ event, college: c.id, date: iso })}">${c.name}</a>` : c.name}</td>
+              ${sum(c.summary).map(([, value]) => html`<td class="num">${value}</td>`)}</tr>`,
+          )}</tbody></table></div></section>`
+        : null
+    }
+
+    <section class="card"><div class="table-wrap"><table class="table">
+      <thead><tr><th>Name</th><th>College</th><th>Event</th>${arrivals ? html`<th>Mobile</th>` : null}
+        <th>${arrivals ? 'Expected arrival' : 'Expected departure'}</th>
+        <th>${arrivals ? 'Actual IN' : 'Actual OUT'}</th><th>Now</th><th>Status</th></tr></thead>
+      <tbody>
+        ${list.rows.map(
+          (r) => html`<tr>
+            <td><a href="/admin/registrations/${r.id}">${r.person.name ?? r.person.email}</a></td>
+            <td class="small">${r.person.college}</td>
+            <td class="small">${eventName(r.eventSlug)}</td>
+            ${arrivals ? html`<td class="small">${r.person.phone}</td>` : null}
+            <td class="small">${fmtDay(arrivals ? r.expectedArrivalDate : r.expectedDepartureDate)}</td>
+            <td class="small">${
+              arrivals
+                ? r.enteredAt
+                  ? html`${badge('Arrived', 'ok')}<br>${fmtExact(r.enteredAt)}`
+                  : html`<span class="muted">Not arrived</span>`
+                : r.lastCheckOutAt && !r.insideSince
+                  ? html`${badge('Checked out', 'ok')}<br>${fmtExact(r.lastCheckOutAt)}`
+                  : html`<span class="muted">Not checked out</span>`
+            }</td>
+            <td>${presenceBadge(r)}</td>
+            <td>${paymentBadge(r.paymentStatus)} ${blockedBadge(r.person)}</td>
+          </tr>`,
+        )}
+        ${list.rows.length === 0 ? html`<tr><td colspan="8" class="muted center">No one has this planned date.</td></tr>` : null}
+      </tbody>
+    </table></div></section>`;
+}

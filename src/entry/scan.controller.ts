@@ -1,4 +1,18 @@
-import { Body, Controller, Get, Param, Post, Query, Req, Res, UseFilters, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  ForbiddenException,
+  Get,
+  NotFoundException,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Query,
+  Req,
+  Res,
+  UseFilters,
+  UseGuards,
+} from '@nestjs/common';
 import { PaymentStatus, StaffRole } from '@prisma/client';
 import { Response } from 'express';
 import { AuthService } from '../auth/auth.service';
@@ -6,11 +20,16 @@ import { StaffRequest } from '../auth/auth.types';
 import { StaffGuard } from '../auth/staff.guard';
 import { AppConfig } from '../config/app-config.service';
 import { DriveService } from '../drive/drive.service';
+import { QrEmailError, QrEmailService } from '../emails/qr-email.service';
+import { PaymentActionError, PaymentsService } from '../payments/payments.service';
+import { maskAadhaar } from '../registrations/aadhaar-crypto';
+import { ParticipantActionError, ParticipantsService } from '../registrations/participants.service';
 import { setFlash, takeFlash } from '../web/cookies';
-import { html } from '../web/html';
-import { csrfField, fmtDate, page, paymentBadge } from '../web/layout';
+import { SafeHtml, html } from '../web/html';
+import { badge, csrfField, fmtDate, page, paymentBadge } from '../web/layout';
 import { WebExceptionFilter } from '../web/web-exception.filter';
-import { EntryService } from './entry.service';
+import { checkInFlash, checkOutFlash } from './entry-messages';
+import { EntryService, GATE_PAGE_SIZE } from './entry.service';
 
 /** Pulls the token out of a scanned/pasted pass URL, or accepts a bare token. */
 export function extractQrToken(code: string): string | null {
@@ -28,6 +47,20 @@ function teamProgress(team: { registrations: { enteredAt: Date | null }[] } | nu
   return html`<p class="small ${entered === total ? '' : 'muted'}">${entered === total ? `Whole team entered (${total}/${total})` : `${entered}/${total} of team entered`}</p>`;
 }
 
+type GatePerson = NonNullable<Awaited<ReturnType<EntryService['lookup']>>>;
+
+/** "p•••@example.com": enough for a volunteer to confirm, without revealing the address. */
+function maskEmail(email: string) {
+  const [local, domain] = email.split('@');
+  return `${local.slice(0, 1)}•••@${domain ?? ''}`;
+}
+
+/**
+ * The gate: QR pass pages (/p/<token>) and the manual gate (/gate/<registrationId>, no QR).
+ * Both render the same card and call the same EntryService, so IN/OUT state, EntryLog and
+ * history are shared; manual actions are recorded as "manual (no QR scan)".
+ * Any signed-in staff role (volunteer, coordinator, admin) may operate the gate.
+ */
 @Controller()
 @UseFilters(WebExceptionFilter)
 export class ScanController {
@@ -36,7 +69,12 @@ export class ScanController {
     private readonly auth: AuthService,
     private readonly drive: DriveService,
     private readonly config: AppConfig,
+    private readonly qrEmails: QrEmailService,
+    private readonly payments: PaymentsService,
+    private readonly participants: ParticipantsService,
   ) {}
+
+  private readonly eventName = (slug: string) => this.config.eventName(slug);
 
   @Get('scan')
   @UseGuards(StaffGuard)
@@ -63,6 +101,10 @@ export class ScanController {
             <label>Or paste the pass link / code <input name="code" required autocomplete="off"></label>
             <button>Open</button>
           </form>
+          <form method="get" action="/scan/find" class="row-form">
+            <label>No QR? Find the participant by name or college <input name="q" required minlength="2" autocomplete="off"></label>
+            <button>Find</button>
+          </form>
         </section>`,
       }),
     );
@@ -77,6 +119,69 @@ export class ScanController {
       return res.redirect(303, '/scan');
     }
     res.redirect(303, `/p/${token}`);
+  }
+
+  /**
+   * Participant directory (any staff role): every participant, searchable by name, college or
+   * event, paged. Rows open the gate card. Only gate-safe columns are queried.
+   */
+  @Get('scan/find')
+  @UseGuards(StaffGuard)
+  async find(@Query('q') q: string | undefined, @Query('page') pageParam: string | undefined, @Req() req: StaffRequest, @Res() res: Response) {
+    res.set('Cache-Control', 'no-store');
+    const query = (q ?? '').trim().slice(0, 100);
+    const pageNo = Math.max(1, Math.min(10_000, Number.parseInt(pageParam ?? '1', 10) || 1));
+    const { rows: results, total } = await this.entry.searchForGate(query, pageNo);
+    const pages = Math.max(1, Math.ceil(total / GATE_PAGE_SIZE));
+    const pageLink = (n: number) => `/scan/find?${new URLSearchParams({ ...(query ? { q: query } : {}), page: String(n) }).toString()}`;
+    res.type('html').send(
+      page({
+        title: 'Find participant',
+        section: 'find',
+        staff: req.staff,
+        csrf: this.auth.csrfToken(req.staff!.sessionId),
+        body: html`<p class="small"><a href="/scan">← Scan</a></p>
+          <h1>Find participant</h1>
+          <form method="get" action="/scan/find" class="row-form search">
+            <input type="search" name="q" value="${query}" placeholder="Name, college or event">
+            <button>Search</button>
+            ${query ? html`<a href="/scan/find">Clear</a>` : null}
+          </form>
+          <p class="muted small">${total} participant registration(s)${query ? html` matching “${query}”` : null}. Open one to check in/out, send their QR email${this.canVerify(req) ? ', verify' : ''} or change their email.</p>
+          <section class="card"><div class="table-wrap"><table class="table rows-clickable">
+            <thead><tr><th>Name</th><th>College</th><th>Event</th><th>Status</th></tr></thead>
+            <tbody>
+              ${results.map(
+                (r) => html`<tr data-href="/gate/${r.id}">
+                  <td><a href="/gate/${r.id}">${r.person.name}</a></td>
+                  <td class="small">${r.person.college}</td>
+                  <td class="small">${this.eventName(r.eventSlug)}</td>
+                  <td>${
+                    r.person.blockedAt
+                      ? badge('Blocked', 'bad')
+                      : r.paymentStatus !== PaymentStatus.VERIFIED
+                        ? badge('Not verified', 'warn')
+                        : r.insideSince
+                          ? badge('Inside', 'ok')
+                          : badge('Outside', 'muted')
+                  }</td>
+                </tr>`,
+              )}
+              ${results.length === 0 ? html`<tr><td colspan="4" class="muted center">${query ? 'No one found.' : 'No participants yet.'}</td></tr>` : null}
+            </tbody>
+          </table></div></section>
+          ${
+            pages > 1
+              ? html`<nav class="pager">
+                  ${pageNo > 1 ? html`<a href="${pageLink(pageNo - 1)}">← Prev</a>` : null}
+                  <span>Page ${pageNo} of ${pages}</span>
+                  ${pageNo < pages ? html`<a href="${pageLink(pageNo + 1)}">Next →</a>` : null}
+                </nav>`
+              : null
+          }`,
+        scripts: ['/assets/admin.js'],
+      }),
+    );
   }
 
   /** The URL inside every QR. Anonymous visitors learn nothing; staff see the entry card. */
@@ -97,54 +202,208 @@ export class ScanController {
       );
     }
 
-    const csrf = this.auth.csrfToken(staff.sessionId);
     const person = await this.entry.lookup(token);
-    const flash = takeFlash(req, res);
     if (!person) {
       return res.status(404).type('html').send(
         page({
           title: 'Invalid pass',
           section: 'scan',
           staff,
-          csrf,
-          flash,
-          body: html`<section class="verdict verdict-bad"><h1>NOT A VALID PASS</h1><p>Do not admit. Ask for the email with their QR, or send them to the help desk.</p></section>
+          csrf: this.auth.csrfToken(staff.sessionId),
+          flash: takeFlash(req, res),
+          body: html`<section class="verdict verdict-bad"><h1>INVALID QR</h1><p>Not an Infinito pass. Do not admit. Ask for the email with their QR, or send them to the help desk.</p></section>
             <p class="center"><a class="button big" href="/scan">Scan next</a></p>`,
         }),
       );
     }
+    this.sendGateCard(req, res, person, (path) => `/p/${token}/${path}`, null);
+  }
 
+  /** Manual gate (no QR): the same card, reached from /scan/find or the participant page. */
+  @Get('gate/:registrationId')
+  @UseGuards(StaffGuard)
+  async manualGate(@Param('registrationId', ParseUUIDPipe) registrationId: string, @Req() req: StaffRequest, @Res() res: Response) {
+    res.set('Cache-Control', 'no-store');
+    const person = await this.entry.lookupByRegistration(registrationId);
+    if (!person) throw new NotFoundException('Participant not found');
+    this.sendGateCard(req, res, person, (path) => `/gate/${path}`, registrationId);
+  }
+
+  @Post('p/:token/enter')
+  @UseGuards(StaffGuard)
+  async enter(@Param('token') token: string, @Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
+    const outcome = await this.entry.checkIn(this.gateAction(body, req, token));
+    setFlash(res, checkInFlash(outcome, this.eventName), this.config.secureCookies);
+    res.redirect(303, `/p/${token}`);
+  }
+
+  /** Gate check-out. Any signed-in staff, like check-in (the exit gate is staffed by volunteers). */
+  @Post('p/:token/exit')
+  @UseGuards(StaffGuard)
+  async exit(@Param('token') token: string, @Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
+    const outcome = await this.entry.checkOut(this.gateAction(body, req, token));
+    setFlash(res, checkOutFlash(outcome, this.eventName), this.config.secureCookies);
+    res.redirect(303, `/p/${token}`);
+  }
+
+  /** Manual check-in without a QR scan; same rules (verified, not blocked, atomic) as a scan. */
+  @Post('gate/enter')
+  @UseGuards(StaffGuard)
+  async manualEnter(@Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
+    const action = this.gateAction(body, req);
+    const outcome = await this.entry.checkIn(action);
+    setFlash(res, checkInFlash(outcome, this.eventName), this.config.secureCookies);
+    res.redirect(303, outcome.result === 'not-found' ? '/scan' : `/gate/${action.registrationId}`);
+  }
+
+  @Post('gate/exit')
+  @UseGuards(StaffGuard)
+  async manualExit(@Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
+    const action = this.gateAction(body, req);
+    const outcome = await this.entry.checkOut(action);
+    setFlash(res, checkOutFlash(outcome, this.eventName), this.config.secureCookies);
+    res.redirect(303, outcome.result === 'not-found' ? '/scan' : `/gate/${action.registrationId}`);
+  }
+
+  /**
+   * Individual QR email from the gate card: this participant's own pass to their own current
+   * address (same rules as the dashboard: verified only, one queued at a time). Any staff role.
+   * There is no bulk or college-wide email here.
+   */
+  @Post('gate/:registrationId/send-qr')
+  @UseGuards(StaffGuard)
+  async sendQr(@Param('registrationId', ParseUUIDPipe) registrationId: string, @Req() req: StaffRequest, @Res() res: Response) {
+    try {
+      const { toEmail } = await this.qrEmails.resend(registrationId, req.staff!.id);
+      const shown = req.staff!.role === StaffRole.VOLUNTEER ? maskEmail(toEmail) : toEmail;
+      setFlash(res, { type: 'ok', text: `QR email queued to ${shown}` }, this.config.secureCookies);
+    } catch (error) {
+      if (!(error instanceof QrEmailError)) throw error;
+      setFlash(res, { type: 'error', text: error.message }, this.config.secureCookies);
+    }
+    res.redirect(303, `/gate/${registrationId}`);
+  }
+
+  /**
+   * Change email from the gate card (any staff role, incl. volunteers). Same service, checks and
+   * audit as the dashboard: same person, QR token, verification and gate history; old address
+   * kept as an alias; queued emails redirected; nothing is sent automatically.
+   */
+  @Post('gate/:registrationId/change-email')
+  @UseGuards(StaffGuard)
+  async changeEmail(
+    @Param('registrationId', ParseUUIDPipe) registrationId: string,
+    @Body() body: Record<string, unknown>,
+    @Req() req: StaffRequest,
+    @Res() res: Response,
+  ) {
+    const personId = await this.entry.personIdFor(registrationId);
+    if (!personId) throw new NotFoundException('Participant not found');
+    try {
+      const { from, to } = await this.participants.changeEmail(personId, typeof body.email === 'string' ? body.email.slice(0, 320) : '', req.staff!.id);
+      const old = req.staff!.role === StaffRole.VOLUNTEER ? maskEmail(from) : from;
+      setFlash(res, { type: 'ok', text: `Email changed from ${old} to ${to}. No email was sent; use Send QR email if needed.` }, this.config.secureCookies);
+    } catch (error) {
+      if (!(error instanceof ParticipantActionError)) throw error;
+      setFlash(res, { type: 'error', text: error.message }, this.config.secureCookies);
+    }
+    res.redirect(303, `/gate/${registrationId}`);
+  }
+
+  /**
+   * Verify from the gate card. Coordinators/admins always; volunteers only when
+   * VOLUNTEERS_CAN_VERIFY=true (off by default). Same atomic verification as the dashboard.
+   */
+  @Post('gate/:registrationId/verify')
+  @UseGuards(StaffGuard)
+  async verify(@Param('registrationId', ParseUUIDPipe) registrationId: string, @Req() req: StaffRequest, @Res() res: Response) {
+    if (!this.canVerify(req)) throw new ForbiddenException('Volunteers cannot verify registrations');
+    const teamId = await this.entry.teamIdFor(registrationId);
+    if (!teamId) throw new NotFoundException('Participant not found');
+    try {
+      const { message } = await this.payments.verifyTeam(teamId, req.staff!.id);
+      setFlash(res, { type: 'ok', text: message }, this.config.secureCookies);
+    } catch (error) {
+      if (!(error instanceof PaymentActionError)) throw error;
+      setFlash(res, { type: 'error', text: error.message }, this.config.secureCookies);
+    }
+    res.redirect(303, `/gate/${registrationId}`);
+  }
+
+  private canVerify(req: StaffRequest) {
+    return req.staff!.role !== StaffRole.VOLUNTEER || this.config.volunteersCanVerify;
+  }
+
+  private gateAction(body: Record<string, unknown>, req: StaffRequest, qrToken?: string) {
+    const registrationId = typeof body.registrationId === 'string' && /^[0-9a-f-]{36}$/i.test(body.registrationId) ? body.registrationId : '';
+    return {
+      qrToken,
+      registrationId,
+      staffId: req.staff!.id,
+      gate: typeof body.gate === 'string' ? body.gate : undefined,
+    };
+  }
+
+  /**
+   * The gate card: photo, name, college and, per event, the one action the current state allows.
+   * Checks shown in the server's order: verified -> not blocked -> IN/OUT state.
+   */
+  private sendGateCard(
+    req: StaffRequest,
+    res: Response,
+    person: GatePerson,
+    actionUrl: (path: 'enter' | 'exit') => string,
+    manualRegistrationId: string | null,
+  ) {
+    const staff = req.staff!;
+    const csrf = this.auth.csrfToken(staff.sessionId);
     const manage = staff.role !== StaffRole.VOLUNTEER;
+    const canVerify = this.canVerify(req);
+    // Role-filtered: the gate card never carries the encrypted Aadhaar or an Aadhaar link.
+    person.aadhaarEncrypted = null;
     const photo =
       this.drive.enabled && person.photoDriveId
         ? html`<img class="photo" src="/staff/files/${person.id}/photo" alt="Photo of ${person.name}">`
         : html`<div class="photo photo-missing">No photo</div>`;
     const idDoc =
       this.drive.enabled && person.idDocumentDriveId
-        ? html`<a href="/staff/files/${person.id}/id" target="_blank" rel="noopener">View ID document</a>`
+        ? html`<a href="/staff/files/${person.id}/id" target="_blank" rel="noopener">View College ID card</a>`
         : html`<span class="muted">No ID document on file</span>`;
 
-    const rows = person.registrations.map((reg) => {
-      const eventName = this.config.eventName(reg.eventSlug);
-      let verdict;
-      if (reg.paymentStatus !== PaymentStatus.VERIFIED) {
-        verdict = html`<div class="verdict verdict-bad"><b>DO NOT ADMIT</b> · payment ${paymentBadge(reg.paymentStatus)}</div>`;
-      } else if (reg.enteredAt) {
-        verdict = html`<div class="verdict verdict-warn"><b>ALREADY ENTERED</b><br>
-          ${fmtDate(reg.enteredAt)} by ${reg.enteredBy?.name || reg.enteredBy?.email || 'unknown'}${reg.entryLogs[0]?.gate ? html` at ${reg.entryLogs[0].gate}` : null}</div>`;
-      } else {
-        verdict = html`<form method="post" action="/p/${token}/enter" class="enter-form">
+    const rows: SafeHtml[] = person.registrations.map((reg) => {
+      const action = (path: 'enter' | 'exit', label: string, cls: string) => html`<form method="post" action="${actionUrl(path)}" class="enter-form">
           ${csrfField(csrf)}
           <input type="hidden" name="registrationId" value="${reg.id}">
           <input type="hidden" name="gate" class="gate-field">
-          <button class="enter big">MARK ENTERED</button>
+          <button class="${cls} big">${label}</button>
         </form>`;
+      let verdict;
+      if (reg.paymentStatus !== PaymentStatus.VERIFIED) {
+        verdict = html`<div class="verdict verdict-bad"><b>NOT VERIFIED</b> · DO NOT ADMIT · ${paymentBadge(reg.paymentStatus)}</div>`;
+      } else if (person.blockedAt) {
+        // The reason is internal; the gate only learns that access is blocked.
+        verdict = html`<div class="verdict verdict-bad"><b>ACCESS BLOCKED</b><br>Registration access has been blocked. Please contact the coordinator/admin.</div>`;
+      } else if (reg.insideSince) {
+        const last = reg.entryLogs[0];
+        verdict = html`<div class="verdict verdict-warn"><b>ALREADY ENTERED</b> · INSIDE<br>
+          since ${fmtDate(reg.insideSince)}${last?.volunteer ? html` by ${last.volunteer.name || last.volunteer.email}` : null}${last?.gate ? html` at ${last.gate}` : null}</div>
+          ${action('exit', 'CHECK OUT (OUT)', 'exit')}`;
+      } else {
+        verdict = html`${reg.lastCheckOutAt ? html`<p class="small muted">OUTSIDE · checked out at ${fmtDate(reg.lastCheckOutAt)}</p>` : null}
+          ${action('enter', 'MARK ENTERED (CHECK IN)', 'enter')}`;
       }
-      return html`<section class="card registration">
-        <div class="reg-head"><h2>${eventName}</h2>${reg.team ? html`<span class="muted">Team ${reg.team.name}</span>` : null}</div>
+      const small = (path: string, label: string, cls = '') => html`<form method="post" action="/gate/${reg.id}/${path}" class="inline">
+          ${csrfField(csrf)}<button class="small ${cls}">${label}</button></form>`;
+      const tools = [
+        reg.paymentStatus !== PaymentStatus.VERIFIED && reg.paymentStatus !== PaymentStatus.REJECTED && canVerify ? small('verify', 'Verify', 'primary') : null,
+        reg.paymentStatus === PaymentStatus.VERIFIED ? small('send-qr', 'Send QR email') : null,
+      ].filter(Boolean);
+      return html`<section class="card registration ${manualRegistrationId === reg.id ? 'highlight' : ''}">
+        <div class="reg-head"><h2>${this.eventName(reg.eventSlug)}</h2>${reg.team && reg.team.name !== person.name ? html`<span class="muted">Team ${reg.team.name}</span>` : null}</div>
         ${teamProgress(reg.team)}
         ${verdict}
-        ${manage && reg.team ? html`<p class="small"><a href="/admin/teams/${reg.team.id}">Open registration</a></p>` : null}
+        ${tools.length ? html`<div class="actions">${tools}</div>` : null}
+        ${manage ? html`<p class="small"><a href="/admin/registrations/${reg.id}">Open full participant page</a></p>` : null}
       </section>`;
     });
 
@@ -154,57 +413,34 @@ export class ScanController {
         section: 'scan',
         staff,
         csrf,
-        flash,
+        flash: takeFlash(req, res),
         scripts: ['/assets/pass.js'],
-        body: html`<section class="card person">
+        body: html`${manualRegistrationId ? html`<p class="warning small"><b>Manual gate (no QR scanned).</b> Check the photo and college ID before admitting. Actions are recorded under your name as manual.</p>` : null}
+          <section class="card person">
             ${photo}
             <div>
               <h1>${person.name}</h1>
               <p>${person.college || html`<span class="muted">College not given</span>`}</p>
+              ${person.aadhaarLast4 ? html`<p class="small mono">Aadhaar ${maskAadhaar(person.aadhaarLast4)}</p>` : null}
+              <p class="small">Email ${manage ? person.email : maskEmail(person.email)}</p>
               <p class="small">${idDoc}</p>
             </div>
           </section>
           ${rows.length ? rows : html`<p class="muted">No registrations for this pass.</p>`}
+          ${
+            person.registrations[0]
+              ? html`<section class="card">
+                  <form method="post" action="/gate/${manualRegistrationId ?? person.registrations[0].id}/change-email" class="row-form">
+                    ${csrfField(csrf)}
+                    <label>Change email <input type="email" name="email" required placeholder="new@example.com"></label>
+                    <button>Change email</button>
+                  </form>
+                  <p class="muted small">Keeps the same participant, QR pass and history. Nothing is emailed automatically; use Send QR email afterwards.</p>
+                </section>`
+              : null
+          }
           <p class="center"><a class="button big" href="/scan">Scan next</a></p>`,
       }),
     );
-  }
-
-  @Post('p/:token/enter')
-  @UseGuards(StaffGuard)
-  async enter(
-    @Param('token') token: string,
-    @Body() body: Record<string, unknown>,
-    @Req() req: StaffRequest,
-    @Res() res: Response,
-  ) {
-    const outcome = await this.entry.markEntered({
-      qrToken: token,
-      registrationId: typeof body.registrationId === 'string' ? body.registrationId : '',
-      staffId: req.staff!.id,
-      gate: typeof body.gate === 'string' ? body.gate : undefined,
-    });
-    const secure = this.config.secureCookies;
-    switch (outcome.result) {
-      case 'entered':
-        setFlash(res, { type: 'ok', text: `✅ ENTERED at ${fmtDate(outcome.enteredAt)}` }, secure);
-        break;
-      case 'already-entered':
-        setFlash(
-          res,
-          {
-            type: 'error',
-            text: `ALREADY ENTERED at ${fmtDate(outcome.enteredAt)}${outcome.byName ? ` by ${outcome.byName}` : ''}${outcome.gate ? ` (${outcome.gate})` : ''}. Do not admit again.`,
-          },
-          secure,
-        );
-        break;
-      case 'not-verified':
-        setFlash(res, { type: 'error', text: 'Payment is not verified. Do not admit.' }, secure);
-        break;
-      default:
-        setFlash(res, { type: 'error', text: 'Registration not found for this pass' }, secure);
-    }
-    res.redirect(303, `/p/${token}`);
   }
 }
