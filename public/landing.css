@@ -1,0 +1,80 @@
+/* Public landing page ("/") only. Every rule is scoped to body.landing, so no other page
+   is affected. Colours come from the tokens in app.css (light and dark themes). */
+
+.landing { line-height: 1.6; }
+/* Full-width sections: undo the shared app.css `main` padding/width for this page only. */
+.landing main { max-width: none; margin: 0; padding: 0; }
+.landing .lp-wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+.landing .lp-narrow { max-width: 760px; }
+.landing .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.landing .skip-link { position: absolute; left: -9999px; top: 8px; background: var(--surface); padding: 8px 12px; border-radius: 6px; z-index: 10; }
+.landing .skip-link:focus { left: 8px; }
+.landing a:focus-visible, .landing .lp-btn:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+
+/* Header */
+.landing .lp-header { background: var(--surface); border-bottom: 1px solid var(--border); }
+.landing .lp-header-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 64px; }
+.landing .lp-brand { font-weight: 800; font-size: 1.2rem; color: var(--text); text-decoration: none; letter-spacing: 0.01em; }
+.landing .lp-brand span { color: var(--accent); }
+
+/* Buttons */
+.landing .lp-btn {
+  display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 10px 20px;
+  border-radius: 8px; font-weight: 600; text-decoration: none; border: 1px solid var(--accent);
+}
+.landing .lp-btn-primary { background: var(--accent); color: var(--accent-text); }
+.landing .lp-btn-primary:hover { filter: brightness(1.08); }
+.landing .lp-btn-ghost { color: var(--accent); background: transparent; }
+.landing .lp-btn-ghost:hover { background: var(--info-bg); }
+
+/* Hero */
+.landing .lp-hero {
+  background: linear-gradient(180deg, var(--info-bg), var(--bg));
+  border-bottom: 1px solid var(--border);
+  padding: 72px 0 64px; text-align: center;
+}
+.landing .lp-eyebrow { text-transform: uppercase; letter-spacing: 0.18em; font-size: 0.8rem; font-weight: 700; color: var(--accent); margin: 0 0 8px; }
+.landing .lp-hero h1 { font-size: clamp(2.2rem, 6vw, 3.6rem); line-height: 1.1; margin: 0; }
+.landing .lp-subtitle { font-size: clamp(1.1rem, 2.6vw, 1.5rem); color: var(--muted); margin: 6px 0 18px; font-weight: 600; }
+.landing .lp-lead { max-width: 680px; margin: 0 auto 28px; font-size: 1.05rem; }
+
+/* Sections */
+.landing .lp-section { padding: 56px 0; }
+.landing .lp-alt { background: var(--surface); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.landing .lp-section h2 { font-size: clamp(1.35rem, 3vw, 1.75rem); margin: 0 0 14px; }
+.landing .lp-section p { margin: 0 0 12px; }
+
+/* Feature cards */
+.landing .lp-cards {
+  list-style: none; padding: 0; margin: 20px 0 0;
+  display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+.landing .lp-card { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 18px 18px 14px; }
+.landing .lp-card h3 { font-size: 1.05rem; margin: 0 0 6px; }
+.landing .lp-card p { color: var(--muted); margin: 0; font-size: 0.95rem; }
+
+/* Staff portal */
+.landing .lp-staff { text-align: center; }
+.landing .lp-staff .lp-btn { margin-top: 8px; }
+
+/* Footer */
+.landing .lp-footer { background: var(--surface); border-top: 1px solid var(--border); padding: 32px 0 12px; font-size: 0.95rem; }
+.landing .lp-footer p { margin: 0 0 4px; }
+.landing .lp-footer-grid { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 20px; }
+.landing .lp-footer-brand { font-weight: 800; font-size: 1.1rem; }
+.landing .lp-muted { color: var(--muted); }
+.landing .lp-links { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 8px 20px; }
+.landing .lp-links a { display: inline-block; padding: 6px 0; }
+.landing .lp-copy { border-top: 1px solid var(--border); margin-top: 20px !important; padding-top: 12px; color: var(--muted); font-size: 0.85rem; }
+
+/* Tablet & phone */
+@media (max-width: 720px) {
+  .landing .lp-hero { padding: 48px 0 44px; }
+  .landing .lp-section { padding: 40px 0; }
+  .landing .lp-hero .lp-btn, .landing .lp-staff .lp-btn { width: 100%; max-width: 360px; }
+  .landing .lp-footer-grid { flex-direction: column; }
+}
+@media (max-width: 380px) {
+  .landing .lp-wrap { padding: 0 16px; }
+  .landing .lp-header .lp-btn { padding: 8px 12px; }
+}
