@@ -5,6 +5,7 @@ import { Response } from 'express';
 import { AppConfig } from '../config/app-config.service';
 import { SESSION_COOKIE, clearCookie, setCookie, takeFlash } from '../web/cookies';
 import { html } from '../web/html';
+import { landingPage } from '../web/landing';
 import { page } from '../web/layout';
 import { WebExceptionFilter } from '../web/web-exception.filter';
 import { AuthService } from './auth.service';
@@ -26,9 +27,11 @@ export class AuthController {
     private readonly config: AppConfig,
   ) {}
 
+  /** Public landing page for visitors; signed-in staff still go straight to their home page. */
   @Get()
   root(@Req() req: StaffRequest, @Res() res: Response) {
-    res.redirect(303, req.staff ? homeFor(req.staff.role) : '/login');
+    if (req.staff) return res.redirect(303, homeFor(req.staff.role));
+    res.type('html').send(landingPage());
   }
 
   @Get('login')
