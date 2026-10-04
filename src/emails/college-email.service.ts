@@ -44,7 +44,11 @@ export class CollegeEmailService {
     };
   }
 
-  /** Every eligible student gets THEIR OWN pass at THEIR OWN current email (one email per registration). */
+  /**
+   * Every eligible student gets THEIR OWN pass at THEIR OWN current email (one email per registration).
+   * Students without an email are skipped (counted in the message); they can be included in a
+   * college email to one student instead, or get their pass once an email is added.
+   */
   async sendToEach(collegeId: string, eventSlug: string | undefined, actorId: string): Promise<BatchResult> {
     const result = await this.prisma.$transaction(
       async (tx) => {
@@ -72,7 +76,8 @@ export class CollegeEmailService {
             })
           ).map((r) => r.registrationId),
         );
-        const toSend = regs.filter((r) => !waiting.has(r.id));
+        const noEmail = regs.filter((r) => !r.person.email).length;
+        const toSend = regs.flatMap((r) => (!waiting.has(r.id) && r.person.email ? [{ ...r, toEmail: r.person.email }] : []));
 
         const batch = await tx.emailBatch.create({
           data: {
@@ -87,6 +92,7 @@ export class CollegeEmailService {
         await this.outbox.enqueue(
           toSend.map((reg) => ({
             ...this.qrEmails.qrEmail(reg, reg.team?.name ?? ''),
+            toEmail: reg.toEmail,
             idempotencyKey: `qr-pass:${reg.id}:bulk:${batch.id}`,
             triggeredById: actorId,
             batchId: batch.id,
@@ -99,16 +105,17 @@ export class CollegeEmailService {
             registrationId: reg.id,
             type: ActivityType.QR_EMAIL_BULK_QUEUED,
             actorId,
-            details: { batchId: batch.id, toEmail: reg.person.email, collegeId, eventSlug: eventSlug ?? null },
+            details: { batchId: batch.id, toEmail: reg.toEmail, collegeId, eventSlug: eventSlug ?? null },
           })),
         );
         return {
           batchId: batch.id,
           eligible: regs.length,
           queued: toSend.length,
-          alreadyQueued: regs.length - toSend.length,
+          alreadyQueued: regs.length - noEmail - toSend.length,
           message: `Queued ${toSend.length} QR email(s), each to the student's own address` +
-            (regs.length > toSend.length ? `; ${regs.length - toSend.length} already had one waiting` : ''),
+            (regs.length - noEmail > toSend.length ? `; ${regs.length - noEmail - toSend.length} already had one waiting` : '') +
+            (noEmail ? `; ${noEmail} skipped (no email)` : ''),
         };
       },
       { maxWait: 10_000, timeout: 60_000 },
@@ -143,6 +150,8 @@ export class CollegeEmailService {
         if (!recipient) {
           throw new QrEmailError('The selected student must be a verified participant of this college');
         }
+        const recipientEmail = recipient.email;
+        if (!recipientEmail) throw new QrEmailError('The selected student has no email; add one first or choose another student');
 
         const pending = await tx.emailOutbox.count({
           where: {
@@ -167,7 +176,7 @@ export class CollegeEmailService {
         for (const reg of regs) {
           const entry = byPerson.get(reg.personId) ?? {
             pass: {
-              name: reg.person.name ?? reg.person.email,
+              name: reg.person.name ?? reg.person.email ?? '',
               events: '',
               qrUrl: qrPassUrl(this.config.baseUrl, reg.person.qrToken!),
             },
@@ -187,7 +196,7 @@ export class CollegeEmailService {
             collegeId,
             eventSlug: eventSlug ?? null,
             recipientPersonId: recipient.id,
-            recipientEmail: recipient.email,
+            recipientEmail,
             triggeredById: actorId,
             eligibleCount: passes.length,
             queuedCount: parts,
@@ -196,7 +205,7 @@ export class CollegeEmailService {
         await this.outbox.enqueue(
           Array.from({ length: parts }, (_, i) => ({
             idempotencyKey: `college-passes:${batch.id}:${i + 1}`,
-            toEmail: recipient.email,
+            toEmail: recipientEmail,
             personId: recipient.id,
             registrationId: recipientReg?.id,
             triggeredById: actorId,
@@ -224,7 +233,7 @@ export class CollegeEmailService {
               batchId: batch.id,
               collegeId,
               recipientPersonId: recipient.id,
-              recipientEmail: recipient.email,
+              recipientEmail,
               passes: passes.length,
             },
           })),
@@ -236,7 +245,7 @@ export class CollegeEmailService {
           eligible: passes.length,
           queued: parts,
           alreadyQueued: 0,
-          message: `Queued ${passes.length} pass(es) in ${parts} email(s) to ${recipient.email}`,
+          message: `Queued ${passes.length} pass(es) in ${parts} email(s) to ${recipientEmail}`,
         };
       },
       { maxWait: 10_000, timeout: 60_000 },

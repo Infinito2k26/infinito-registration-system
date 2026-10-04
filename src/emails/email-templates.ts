@@ -51,11 +51,20 @@ export async function renderEmail(template: string, payload: Payload): Promise<R
       return {
         html: layout(`<p>Hi ${e(payload, 'name')},</p>
 <p>We've received your registration for <b>${e(payload, 'eventName')}</b>${teamSuffixHtml(payload)}.</p>
-<p>Our team will verify your registration${payload.transactionId ? ` (transaction <b>${e(payload, 'transactionId')}</b>)` : ''}. Once it's verified, you'll get a separate email with your personal QR entry pass.</p>`),
+${
+          // Sent late (email added after verification): the pass follows in its own email.
+          payload.verified
+            ? `<p>Your registration is verified. Your personal QR entry pass is in a separate email.</p>`
+            : `<p>Our team will verify your registration${payload.transactionId ? ` (transaction <b>${e(payload, 'transactionId')}</b>)` : ''}. Once it's verified, you'll get a separate email with your personal QR entry pass.</p>`
+        }`),
         text: `Hi ${s(payload, 'name')},
 
 We've received your registration for ${s(payload, 'eventName')}${teamSuffixText(payload)}.
-Our team will verify your registration. Once it's verified, you'll get a separate email with your personal QR entry pass.`,
+${
+  payload.verified
+    ? 'Your registration is verified. Your personal QR entry pass is in a separate email.'
+    : "Our team will verify your registration. Once it's verified, you'll get a separate email with your personal QR entry pass."
+}`,
       };
 
     case EmailTemplate.QrPass: {

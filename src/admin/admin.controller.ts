@@ -24,7 +24,7 @@ import { QrEmailError, QrEmailService } from '../emails/qr-email.service';
 import { checkInFlash, checkOutFlash } from '../entry/entry-messages';
 import { EntryService } from '../entry/entry.service';
 import { PaymentActionError, PaymentsService } from '../payments/payments.service';
-import { ParticipantActionError, ParticipantsService } from '../registrations/participants.service';
+import { ParticipantActionError, ParticipantsService, changeEmailMessage } from '../registrations/participants.service';
 import { Flash, setFlash, takeFlash } from '../web/cookies';
 import { SafeHtml } from '../web/html';
 import { NavSection, page } from '../web/layout';
@@ -45,7 +45,7 @@ import {
 type Decision = 'verify' | 'reject' | 'undo';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const parsePage = (value: string | undefined) => Math.max(1, Math.min(10_000, Number.parseInt(value ?? '1', 10) || 1));
-/** ?status=pending|verified|rejected|blocked|inside|outside (any case); ?blocked=1 is kept as an alias. */
+/** ?status=pending|verified|rejected|blocked|inside|outside|entered (any case); ?blocked=1 is kept as an alias. */
 const parseView = (status: string | undefined, blocked: string | undefined): RegistrationView | undefined => {
   const value = status?.toUpperCase();
   if (REGISTRATION_VIEWS.includes(value as RegistrationView)) return value as RegistrationView;
@@ -152,7 +152,9 @@ export class AdminController {
       req,
       res,
       filters.event ? this.eventName(filters.event) : 'Registrations',
-      filters.view === 'INSIDE' || filters.view === 'OUTSIDE' || filters.view === 'BLOCKED' ? (filters.view.toLowerCase() as NavSection) : 'registrations',
+      filters.view === 'INSIDE' || filters.view === 'OUTSIDE' || filters.view === 'ENTERED' || filters.view === 'BLOCKED'
+        ? (filters.view.toLowerCase() as NavSection)
+        : 'registrations',
       registrationsPage({ filters, list, events, collegeName: collegeRow ?? undefined, eventName: this.eventName }),
     );
   }
@@ -246,8 +248,7 @@ export class AdminController {
     const personId = await this.queries.personIdForRegistration(id);
     if (!personId) throw new NotFoundException('Participant not found');
     await this.act(res, `/admin/registrations/${id}`, async () => {
-      const { from, to } = await this.participants.changeEmail(personId, text(body.email, 320), req.staff!.id);
-      return { message: `Email changed from ${from} to ${to}. No email was sent; use Send QR email if needed.` };
+      return { message: changeEmailMessage(await this.participants.changeEmail(personId, text(body.email, 320), req.staff!.id)) };
     });
   }
 

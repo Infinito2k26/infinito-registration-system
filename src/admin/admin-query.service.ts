@@ -7,7 +7,7 @@ export const PAGE_SIZE = 50;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** The status chips / counter tiles of the registrations list; each one is a filter. */
-export const REGISTRATION_VIEWS = ['PENDING', 'VERIFIED', 'REJECTED', 'BLOCKED', 'INSIDE', 'OUTSIDE'] as const;
+export const REGISTRATION_VIEWS = ['PENDING', 'VERIFIED', 'REJECTED', 'BLOCKED', 'INSIDE', 'OUTSIDE', 'ENTERED'] as const;
 export type RegistrationView = (typeof REGISTRATION_VIEWS)[number];
 
 export interface RegistrationFilters {
@@ -23,7 +23,12 @@ export interface RegistrationFilters {
   page: number;
 }
 
-/** Status / gate-state condition of a view. INSIDE = checked in and not checked out since. */
+/**
+ * Status / gate-state condition of a view. INSIDE = checked in and not checked out since;
+ * OUTSIDE = not inside now. ENTERED ("Ever entered") = at least one successful gate check-in,
+ * ever: Registration.enteredAt is set once by the first successful IN and never cleared, so a
+ * later check-out does not remove anyone and re-entry adds nothing (one row per registration).
+ */
 export function viewWhere(view: RegistrationView): Prisma.RegistrationWhereInput {
   switch (view) {
     case 'PENDING':
@@ -36,13 +41,16 @@ export function viewWhere(view: RegistrationView): Prisma.RegistrationWhereInput
       return { insideSince: { not: null } };
     case 'OUTSIDE':
       return { insideSince: null };
+    case 'ENTERED':
+      return { enteredAt: { not: null } };
   }
 }
 
 /**
  * Dashboard counters, over registrations (one per participant per event):
  *   total = all; verified/pending/rejected by verification status;
- *   inside = checked in and not checked out; outside = total - inside.
+ *   inside = checked in and not checked out; outside = total - inside;
+ *   everEntered = checked in successfully at least once (inside now or not).
  */
 export interface Counters {
   total: number;
@@ -53,6 +61,7 @@ export interface Counters {
   blocked: number;
   inside: number;
   outside: number;
+  everEntered: number;
 }
 
 export type ExpectedKind = 'arrival' | 'departure';
@@ -157,12 +166,21 @@ export class AdminQueryService {
     const [registrations, total, counters] = await Promise.all([
       this.prisma.registration.findMany({
         where,
-        orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
+        // Ever entered: most recent first entries first.
+        orderBy: filters.view === 'ENTERED' ? [{ enteredAt: 'desc' }, { id: 'asc' }] : [{ createdAt: 'desc' }, { id: 'asc' }],
         skip: (filters.page - 1) * PAGE_SIZE,
         take: PAGE_SIZE,
         include: {
           person: { select: { name: true, email: true, phone: true, college: true, collegeId: true, blockedAt: true } },
           team: { select: { id: true, name: true, _count: { select: { registrations: true } } } },
+          // First successful entry (Gate log), shown in the Ever entered list.
+          enteredBy: { select: { name: true, email: true } },
+          entryLogs: {
+            where: { status: EntryStatus.ENTERED, kind: EntryKind.CHECK_IN },
+            orderBy: { enteredAt: 'asc' },
+            take: 1,
+            select: { gate: true },
+          },
         },
       }),
       this.prisma.registration.count({ where }),
@@ -177,13 +195,14 @@ export class AdminQueryService {
     return this.countersFor(this.registrationWhere(filter));
   }
 
-  /** TOTAL/VERIFIED/PENDING/REJECTED/BLOCKED/INSIDE/OUTSIDE over registrations matching `where`. */
+  /** TOTAL/VERIFIED/PENDING/REJECTED/BLOCKED/INSIDE/OUTSIDE/EVER ENTERED over registrations matching `where`. */
   async countersFor(where: Prisma.RegistrationWhereInput): Promise<Counters> {
     const count = (view: RegistrationView) => this.prisma.registration.count({ where: { AND: [where, viewWhere(view)] } });
-    const [byStatus, inside, blocked] = await Promise.all([
+    const [byStatus, inside, blocked, everEntered] = await Promise.all([
       this.prisma.registration.groupBy({ by: ['paymentStatus'], where, _count: { _all: true } }),
       count('INSIDE'),
       count('BLOCKED'),
+      count('ENTERED'),
     ]);
     const of = (status: PaymentStatus) => byStatus.find((b) => b.paymentStatus === status)?._count._all ?? 0;
     const total = byStatus.reduce((n, b) => n + b._count._all, 0);
@@ -195,6 +214,7 @@ export class AdminQueryService {
       blocked,
       inside,
       outside: total - inside,
+      everEntered,
     };
   }
 
@@ -250,7 +270,7 @@ export class AdminQueryService {
     const event = filter.event ?? null;
     const q = filter.q ?? null;
     const rows = await this.prisma.$queryRaw<
-      { id: string; name: string; total: bigint; verified: bigint; pending: bigint; rejected: bigint; blocked: bigint; inside: bigint }[]
+      { id: string; name: string; total: bigint; verified: bigint; pending: bigint; rejected: bigint; blocked: bigint; inside: bigint; entered: bigint }[]
     >`
       SELECT c."id", c."name",
         COUNT(r."id") AS total,
@@ -258,7 +278,8 @@ export class AdminQueryService {
         COUNT(r."id") FILTER (WHERE r."paymentStatus" = 'PENDING') AS pending,
         COUNT(r."id") FILTER (WHERE r."paymentStatus" = 'REJECTED') AS rejected,
         COUNT(r."id") FILTER (WHERE p."blockedAt" IS NOT NULL) AS blocked,
-        COUNT(r."id") FILTER (WHERE r."insideSince" IS NOT NULL) AS inside
+        COUNT(r."id") FILTER (WHERE r."insideSince" IS NOT NULL) AS inside,
+        COUNT(r."id") FILTER (WHERE r."enteredAt" IS NOT NULL) AS entered
       FROM "College" c
       JOIN "Person" p ON p."collegeId" = c."id"
       JOIN "Registration" r ON r."personId" = p."id"
@@ -279,6 +300,7 @@ export class AdminQueryService {
         blocked: Number(r.blocked),
         inside,
         outside: total - inside,
+        everEntered: Number(r.entered),
       };
     });
   }

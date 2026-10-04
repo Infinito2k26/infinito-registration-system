@@ -8,7 +8,8 @@ export interface ParsedMember {
   position: number;
   isCaptain: boolean;
   name: string;
-  email: string;
+  /** Resolved email (first valid alias in priority order); undefined = no usable email. */
+  email?: string;
   phone?: string;
   college?: string;
   photoDriveId?: string;
@@ -50,7 +51,10 @@ export type ParseResult =
   | { ok: false; errors: string[] };
 
 export interface ParseContext {
-  /** Email collected by the form itself ("Collect email addresses"), used if member 1 has none. */
+  /**
+   * The sheet's "Email Address" column (the form's collected email), which the Apps Script sends
+   * separately. Treated exactly like an "Email Address" answer: first priority for member 1.
+   */
   respondentEmail?: string;
 }
 
@@ -176,12 +180,29 @@ function buildLookup(answers: RawAnswers): Map<string, string> {
 }
 
 function pick(lookup: Map<string, string>, aliases: string[], n?: number) {
+  return pickAll(lookup, aliases, n)[0];
+}
+
+/** Every non-empty answer among the aliases, in alias (= priority) order. */
+function pickAll(lookup: Map<string, string>, aliases: string[], n?: number): string[] {
+  const values: string[] = [];
   for (const alias of aliases) {
     const title = n === undefined ? alias : alias.replace('{n}', String(n));
     const value = lookup.get(normalizeTitle(title));
-    if (value) return value;
+    if (value) values.push(value);
   }
-  return undefined;
+  return values;
+}
+
+/** The first VALID email in priority order (normalized), plus the invalid ones seen. */
+export function resolveEmail(candidates: string[]): { email?: string; invalid: string[] } {
+  const invalid: string[] = [];
+  for (const candidate of candidates) {
+    const email = normalizeEmail(candidate);
+    if (emailSchema.safeParse(email).success) return { email, invalid };
+    invalid.push(candidate);
+  }
+  return { invalid };
 }
 
 export function parseFormResponse(
@@ -190,6 +211,9 @@ export function parseFormResponse(
   context: ParseContext = {},
 ): ParseResult {
   const lookup = buildLookup(answers);
+  // The collected "Email Address" column arrives outside `answers`; give it its column title.
+  const respondentEmail = context.respondentEmail?.trim();
+  if (respondentEmail && !lookup.get(normalizeTitle('Email Address'))) lookup.set(normalizeTitle('Email Address'), respondentEmail);
   const errors: string[] = [];
   const warnings: string[] = [];
   const members: ParsedMember[] = [];
@@ -203,7 +227,7 @@ export function parseFormResponse(
       (n === 1 ? pick(lookup, map.captain[key] ?? []) : undefined);
 
     const name = field('name');
-    let email = field('email');
+    const emailCandidates = [...pickAll(lookup, map.member.email, n), ...(n === 1 ? pickAll(lookup, map.captain.email ?? []) : [])];
     const phone = field('phone');
     const college = field('college');
     const photo = field('photo');
@@ -212,32 +236,33 @@ export function parseFormResponse(
     const aadhaarNumber = field('aadhaarNumber');
     const aadhaarPhoto = field('aadhaarPhoto');
 
-    if (n === 1 && !email && name && context.respondentEmail) {
-      email = context.respondentEmail;
-    }
-
-    if (![name, email, phone, college, photo, idDocument, rollNumber, aadhaarNumber, aadhaarPhoto].some(Boolean)) {
+    if (![name, emailCandidates.length > 0, phone, college, photo, idDocument, rollNumber, aadhaarNumber, aadhaarPhoto].some(Boolean)) {
       continue;
     }
 
     const label = `Member ${n}`;
-    if (!name) errors.push(`${label}: name is missing`);
-    if (!email) {
-      errors.push(`${label}: email is missing`);
-    } else if (!emailSchema.safeParse(normalizeEmail(email)).success) {
-      errors.push(`${label}: "${email}" is not a valid email`);
-    }
-    if (!name || !email) continue;
-
-    const normalizedEmail = normalizeEmail(email);
-    const duplicateOf = seenEmails.get(normalizedEmail);
-    if (duplicateOf !== undefined) {
-      errors.push(
-        `${label}: email ${normalizedEmail} is also used by Member ${duplicateOf}`,
-      );
+    if (!name) {
+      errors.push(`${label}: name is missing`);
       continue;
     }
-    seenEmails.set(normalizedEmail, n);
+    // Email is optional: a missing or unusable email never rejects the registration.
+    const { email: normalizedEmail, invalid } = resolveEmail(emailCandidates);
+    if (!normalizedEmail) {
+      warnings.push(
+        invalid.length
+          ? `${label}: "${invalid[0]}" is not a valid email; registered without an email`
+          : `${label}: no email; registered without one (add it later with Change email)`,
+      );
+    } else {
+      const duplicateOf = seenEmails.get(normalizedEmail);
+      if (duplicateOf !== undefined) {
+        errors.push(
+          `${label}: email ${normalizedEmail} is also used by Member ${duplicateOf}`,
+        );
+        continue;
+      }
+      seenEmails.set(normalizedEmail, n);
+    }
 
     let normalizedPhone: string | undefined;
     if (phone) {

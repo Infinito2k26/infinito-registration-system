@@ -23,7 +23,7 @@ import { DriveService } from '../drive/drive.service';
 import { QrEmailError, QrEmailService } from '../emails/qr-email.service';
 import { PaymentActionError, PaymentsService } from '../payments/payments.service';
 import { maskAadhaar } from '../registrations/aadhaar-crypto';
-import { ParticipantActionError, ParticipantsService } from '../registrations/participants.service';
+import { ParticipantActionError, ParticipantsService, changeEmailMessage } from '../registrations/participants.service';
 import { setFlash, takeFlash } from '../web/cookies';
 import { SafeHtml, html } from '../web/html';
 import { badge, csrfField, fmtDate, page, paymentBadge } from '../web/layout';
@@ -287,7 +287,8 @@ export class ScanController {
   /**
    * Change email from the gate card (any staff role, incl. volunteers). Same service, checks and
    * audit as the dashboard: same person, QR token, verification and gate history; old address
-   * kept as an alias; queued emails redirected; nothing is sent automatically.
+   * kept as an alias; queued emails redirected. Changing an email sends nothing; adding the
+   * first email queues the registration email (and the QR email if verified).
    */
   @Post('gate/:registrationId/change-email')
   @UseGuards(StaffGuard)
@@ -300,9 +301,9 @@ export class ScanController {
     const personId = await this.entry.personIdFor(registrationId);
     if (!personId) throw new NotFoundException('Participant not found');
     try {
-      const { from, to } = await this.participants.changeEmail(personId, typeof body.email === 'string' ? body.email.slice(0, 320) : '', req.staff!.id);
-      const old = req.staff!.role === StaffRole.VOLUNTEER ? maskEmail(from) : from;
-      setFlash(res, { type: 'ok', text: `Email changed from ${old} to ${to}. No email was sent; use Send QR email if needed.` }, this.config.secureCookies);
+      const result = await this.participants.changeEmail(personId, typeof body.email === 'string' ? body.email.slice(0, 320) : '', req.staff!.id);
+      const old = req.staff!.role === StaffRole.VOLUNTEER && result.from ? maskEmail(result.from) : result.from;
+      setFlash(res, { type: 'ok', text: changeEmailMessage(result, old) }, this.config.secureCookies);
     } catch (error) {
       if (!(error instanceof ParticipantActionError)) throw error;
       setFlash(res, { type: 'error', text: error.message }, this.config.secureCookies);
@@ -422,7 +423,7 @@ export class ScanController {
               <h1>${person.name}</h1>
               <p>${person.college || html`<span class="muted">College not given</span>`}</p>
               ${person.aadhaarLast4 ? html`<p class="small mono">Aadhaar ${maskAadhaar(person.aadhaarLast4)}</p>` : null}
-              <p class="small">Email ${manage ? person.email : maskEmail(person.email)}</p>
+              <p class="small">${person.email ? html`Email ${manage ? person.email : maskEmail(person.email)}` : html`<span class="muted">No email</span>`}</p>
               <p class="small">${idDoc}</p>
             </div>
           </section>
@@ -435,7 +436,7 @@ export class ScanController {
                     <label>Change email <input type="email" name="email" required placeholder="new@example.com"></label>
                     <button>Change email</button>
                   </form>
-                  <p class="muted small">Keeps the same participant, QR pass and history. Nothing is emailed automatically; use Send QR email afterwards.</p>
+                  <p class="muted small">${person.email ? 'Keeps the same participant, QR pass and history. Nothing is emailed automatically; use Send QR email afterwards.' : 'No email yet. Adding one keeps the same participant, QR pass and history, and emails the registration confirmation (plus the QR pass if verified).'}</p>
                 </section>`
               : null
           }
