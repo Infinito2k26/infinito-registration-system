@@ -78,7 +78,9 @@ export const DEFAULT_FORM_FIELD_MAP: FormFieldMap = {
   /** Individual forms ("Name", "Email", "Mobile No." ...) map to member 1. */
   captain: {
     name: ['Captain Name', 'Team Leader Name', 'Name', 'Full Name', 'Participant Name'],
-    email: ['Captain Email', 'Team Leader Email', 'Email', 'Email ID', 'Email Address', 'E-mail'],
+    // "Email Address" (first priority, also the form's collected email) before "Email" (second).
+    // The first alias holding a VALID email wins; none = registered without an email.
+    email: ['Captain Email', 'Team Leader Email', 'Email Address', 'Email', 'Email ID', 'E-mail'],
     phone: ['Captain Phone', 'Team Leader Phone', 'Mobile No', 'Mobile Number', 'Mobile', 'Phone', 'Phone Number', 'Contact Number'],
     photo: ['Captain Photo', 'Photo', 'Passport Size Photo'],
     idDocument: ['Captain ID', 'College ID Card Photo', 'College ID Card', 'College ID', 'ID Card Photo', 'ID Proof'],

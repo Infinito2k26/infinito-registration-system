@@ -101,12 +101,50 @@ describe('parseFormResponse', () => {
     );
     expect(result).toEqual({
       ok: false,
+      // An invalid email is no longer an error (Member 1 is kept, without an email).
       errors: [
-        'Member 1: "a@example" is not a valid email',
         'Member 2: name is missing',
         'Member 4: email b@example.com is also used by Member 3',
         'Transaction ID is missing',
       ],
+    });
+  });
+
+  describe('email priority: "Email Address" first, then "Email"; email is optional', () => {
+    const solo = (answers: Record<string, string>, respondentEmail?: string) =>
+      parseFormResponse({ Name: 'Solo', Sports: 'TT', ...answers }, map, { respondentEmail });
+
+    it('uses "Email Address" when it has a valid email (as an answer or as the collected column)', () => {
+      const asAnswer = solo({ 'Email Address': 'A@Gmail.com', Email: 'b@gmail.com' });
+      expect(asAnswer.ok && asAnswer.value.members[0].email).toBe('a@gmail.com');
+      // The Apps Script sends the sheet's "Email Address" column as respondentEmail.
+      const collected = solo({ Email: 'b@gmail.com' }, 'a@gmail.com');
+      expect(collected.ok && collected.value.members[0].email).toBe('a@gmail.com');
+      const onlyAddress = solo({ 'Email Address': 'a@gmail.com' });
+      expect(onlyAddress.ok && onlyAddress.value.members[0].email).toBe('a@gmail.com');
+    });
+
+    it('falls back to "Email" when "Email Address" is empty or not a valid email', () => {
+      const empty = solo({ 'Email Address': '  ', Email: 'b@gmail.com' }, '');
+      expect(empty.ok && empty.value.members[0].email).toBe('b@gmail.com');
+      const invalid = solo({ Email: 'b@gmail.com' }, 'not-an-email');
+      expect(invalid.ok && invalid.value.members[0].email).toBe('b@gmail.com');
+    });
+
+    it('accepts the registration with no email when both are empty (warning only)', () => {
+      const none = solo({ 'Email Address': '', Email: '' });
+      expect(none.ok).toBe(true);
+      if (!none.ok) return;
+      expect(none.value.members).toHaveLength(1);
+      expect(none.value.members[0]).toMatchObject({ name: 'Solo' });
+      expect(none.value.members[0].email).toBeUndefined();
+      expect(none.warnings.join(' ')).toMatch(/no email/);
+    });
+
+    it('accepts the registration with no email when the only email is invalid (warning only)', () => {
+      const bad = solo({ Email: 'b@gmail' });
+      expect(bad.ok && bad.value.members[0].email).toBeUndefined();
+      expect(bad.ok && bad.warnings.join(' ')).toMatch(/"b@gmail" is not a valid email; registered without an email/);
     });
   });
 

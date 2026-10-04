@@ -55,11 +55,15 @@ export class QrEmailService {
   async queueInitial(
     tx: Prisma.TransactionClient,
     reg: RegistrationWithPerson,
-    context: { teamName: string; actorId: string },
+    context: { teamName: string; actorId?: string; sendAt?: Date },
   ): Promise<boolean> {
     if (!reg.person.qrToken) throw new QrEmailError('Person has no QR token');
+    // No email (yet): nothing that could never be delivered is queued. When an email is added,
+    // ParticipantsService.queueEmailsForNewAddress calls this again with the same key.
+    const toEmail = reg.person.email;
+    if (!toEmail) return false;
     const key = initialQrKey(reg.id);
-    const sendAt = new Date(Date.now() + this.config.decisionEmailDelaySeconds * 1000);
+    const sendAt = context.sendAt ?? new Date(Date.now() + this.config.decisionEmailDelaySeconds * 1000);
 
     const revived = await tx.emailOutbox.updateMany({
       where: { idempotencyKey: key, status: EmailStatus.CANCELLED },
@@ -69,7 +73,7 @@ export class QrEmailService {
       revived.count > 0
         ? 0
         : await this.outbox.enqueue(
-            [{ ...this.qrEmail(reg, context.teamName), idempotencyKey: key, triggeredById: context.actorId, sendAt }],
+            [{ ...this.qrEmail(reg, context.teamName), toEmail, idempotencyKey: key, triggeredById: context.actorId, sendAt }],
             tx,
           );
     return revived.count + created > 0;
@@ -93,6 +97,8 @@ export class QrEmailService {
       if (reg.paymentStatus !== PaymentStatus.VERIFIED || !reg.person.qrToken) {
         throw new QrEmailError('Not verified, so there is no pass to send');
       }
+      const toEmail = reg.person.email;
+      if (!toEmail) throw new QrEmailError('This participant has no email yet; add one with Change email (the pass is then sent automatically)');
 
       const qrRows = await tx.emailOutbox.findMany({
         where: { registrationId, template: EmailTemplate.QrPass },
@@ -113,6 +119,7 @@ export class QrEmailService {
         [
           {
             ...this.qrEmail(reg, reg.team?.name ?? reg.person.name ?? ''),
+            toEmail,
             idempotencyKey: `${resendKeyPrefix(registrationId)}${attempt}`,
             triggeredById: actorId,
           },
@@ -124,10 +131,10 @@ export class QrEmailService {
           registrationId,
           type: ActivityType.QR_EMAIL_RESENT,
           actorId,
-          details: { resend: used + 1, limit: limit || null, toEmail: reg.person.email, result: 'queued' },
+          details: { resend: used + 1, limit: limit || null, toEmail, result: 'queued' },
         },
       ]);
-      result = { toEmail: reg.person.email, manualSends: used + 1 };
+      result = { toEmail, manualSends: used + 1 };
     });
     this.worker.kick();
     return result;
@@ -166,8 +173,8 @@ export class QrEmailService {
 
   qrEmail(reg: RegistrationWithPerson, teamName: string) {
     const eventName = this.config.eventName(reg.eventSlug);
+    // No toEmail here: callers pass the participant's current email after checking there is one.
     return {
-      toEmail: reg.person.email,
       personId: reg.personId,
       registrationId: reg.id,
       template: EmailTemplate.QrPass,

@@ -47,7 +47,7 @@ function pager(base: Record<string, string | undefined>, page: number, total: nu
 }
 
 /**
- * TOTAL / VERIFIED / PENDING / REJECTED / BLOCKED / INSIDE / OUTSIDE (see Counters for definitions).
+ * TOTAL / VERIFIED / PENDING / REJECTED / BLOCKED / INSIDE / OUTSIDE / EVER ENTERED (see Counters for definitions).
  * With `link`, every tile is a filter (TOTAL = all) and the active one is highlighted.
  */
 export function countersBar(
@@ -68,6 +68,7 @@ export function countersBar(
     ${item('Blocked', c.blocked, 'BLOCKED', c.blocked ? 'bad' : '', 'Participant blocked at the gate (cannot check in or out)')}
     ${item('Inside', c.inside, 'INSIDE', 'info', 'Checked in and not checked out since')}
     ${item('Outside', c.outside, 'OUTSIDE', '', 'Not currently inside (never checked in, or checked out)')}
+    ${item('Ever entered', c.everEntered, 'ENTERED', '', 'Checked in at the gate at least once (stays here after checking out)')}
   </div>`;
 }
 
@@ -109,6 +110,7 @@ const VIEW_LABEL: Record<RegistrationView, string> = {
   BLOCKED: 'Blocked',
   INSIDE: 'Inside',
   OUTSIDE: 'Outside',
+  ENTERED: 'Ever entered',
 };
 
 /** One row per registration; every row opens the participant page. */
@@ -137,6 +139,7 @@ export function registrationsPage(args: {
     BLOCKED: c.blocked,
     INSIDE: c.inside,
     OUTSIDE: c.outside,
+    ENTERED: c.everEntered,
   };
   const chip = (view: RegistrationView | undefined, label: string, count: number) =>
     html`<a class="chip ${filters.view === view ? 'active' : ''}" href="${href(view)}" ${filters.view === view ? html`aria-current="true"` : null}>${label} <b>${count}</b></a>`;
@@ -185,7 +188,11 @@ export function registrationsPage(args: {
               <td class="small">${r.person.collegeId ? html`<a href="/admin/colleges/${r.person.collegeId}">${r.person.college}</a>` : r.person.college}</td>
               <td class="small">${r.person.email}${r.person.phone ? html`<br>${r.person.phone}` : null}</td>
               <td>${paymentBadge(r.paymentStatus)} ${blockedBadge(r.person)}</td>
-              <td>${presenceBadge(r)}</td>
+              <td>${presenceBadge(r)}${
+                filters.view === 'ENTERED' && r.enteredAt
+                  ? html`<br><span class="small">first in ${fmtExact(r.enteredAt)} by ${who(r.enteredBy)}${r.entryLogs[0]?.gate ? html` (${r.entryLogs[0].gate})` : null}</span>`
+                  : null
+              }</td>
               <td class="small">${fmtDate(r.createdAt)}</td>
             </tr>`;
           })}
@@ -261,7 +268,7 @@ function activityText(a: { type: ActivityType; details: unknown }): SafeHtml {
     case ActivityType.QR_PASSES_FORWARDED:
       return html`Pass included in a college email to ${str(d.recipientEmail)} (${str(d.passes)} passes)`;
     case ActivityType.EMAIL_CHANGED:
-      return html`<b>Email changed</b> ${str(d.from)} → ${str(d.to)}`;
+      return d.from ? html`<b>Email changed</b> ${str(d.from)} → ${str(d.to)}` : html`<b>Email added</b> ${str(d.to)}${d.source === 'form' ? ' (from the form)' : ''}`;
     case ActivityType.ENTERED:
       return html`<b>Checked in</b>${d.gate ? ` at ${str(d.gate)}` : ''}`;
     case ActivityType.ENTRY_DENIED:
@@ -470,7 +477,7 @@ export function participantPage(args: {
   <section class="card">
     <h2>Participant</h2>
     <dl class="facts">
-      <dt>Email</dt><dd>${p.email}${p.emailBouncedAt ? html` ${badge('bounced', 'bad')} <span class="error-text">${p.emailBounceReason}</span>` : null}</dd>
+      <dt>Email</dt><dd>${p.email ?? html`<span class="muted">No email</span>`}${p.emailBouncedAt ? html` ${badge('bounced', 'bad')} <span class="error-text">${p.emailBounceReason}</span>` : null}</dd>
       ${fact('College', p.college)}
       <dt>Sport / event</dt><dd>${eventName(reg.eventSlug)}</dd>
       ${fact('Mobile', p.phone)}
@@ -495,7 +502,7 @@ export function participantPage(args: {
       <label>Change email <input type="email" name="email" required placeholder="new@example.com"></label>
       <button>Change email</button>
     </form>
-    <p class="muted small">Keeps the same participant, QR pass and history. Nothing is emailed automatically; use Send QR email afterwards.</p>
+    <p class="muted small">${p.email ? 'Keeps the same participant, QR pass and history. Nothing is emailed automatically; use Send QR email afterwards.' : 'No email yet. Adding one keeps the same participant, QR pass and history, and emails the registration confirmation (plus the QR pass if verified).'}</p>
   </section>
 
   <section class="card">
@@ -600,8 +607,9 @@ export function collegesPage(args: {
       blocked: t.blocked + c.blocked,
       inside: t.inside + c.inside,
       outside: t.outside + c.outside,
+      everEntered: t.everEntered + c.everEntered,
     }),
-    { total: 0, verified: 0, pending: 0, rejected: 0, blocked: 0, inside: 0, outside: 0 },
+    { total: 0, verified: 0, pending: 0, rejected: 0, blocked: 0, inside: 0, outside: 0, everEntered: 0 },
   );
   return html`<div class="with-sidebar">
     ${eventSidebar(args.events, event, eventName, '/admin/colleges')}
@@ -640,7 +648,8 @@ export function collegePage(args: {
   const { detail, event, csrf, eventName } = args;
   const { college, registrations } = detail;
   const eligible = registrations.filter((r) => r.paymentStatus === PaymentStatus.VERIFIED && r.person.qrToken);
-  const recipients = [...new Map(eligible.map((r) => [r.person.id, r.person])).values()];
+  // Only students with an email can receive the college email (everyone's passes are included).
+  const recipients = [...new Map(eligible.filter((r) => r.person.email).map((r) => [r.person.id, r.person])).values()];
   const scope = event ? eventName(event) : 'all events';
 
   return html`<p class="small"><a href="/admin/colleges${buildQuery({ event })}">← Colleges</a></p>

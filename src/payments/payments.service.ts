@@ -63,8 +63,15 @@ export class PaymentsService {
         }
       }
 
+      // Same per-person lock as Change email (sorted: no deadlocks), so an email being added at
+      // this moment either is seen here (QR email queued now) or sees VERIFIED (and queues it).
+      for (const personId of [...new Set(toVerify.map((r) => r.personId))].sort()) {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'person-email:' + personId}))`;
+      }
+
       const now = new Date();
       let emailsQueued = 0;
+      let withoutEmail = 0;
       const activity: ActivityEntry[] = [];
       for (const reg of toVerify) {
         // Conditional update so two verifications touching the same person agree on one token.
@@ -91,7 +98,9 @@ export class PaymentsService {
           details: { transactionId: txn ?? null, previousStatus: reg.paymentStatus, qrTokenCreated: created.count === 1 },
         });
 
-        if (await this.qrEmails.queueInitial(tx, { ...updated, person }, { teamName: team.name, actorId })) {
+        // No email: verified with a QR token all the same; the pass is emailed once an email is added.
+        if (!person.email) withoutEmail++;
+        else if (await this.qrEmails.queueInitial(tx, { ...updated, person }, { teamName: team.name, actorId })) {
           emailsQueued++;
           activity.push({ registrationId: reg.id, type: ActivityType.QR_EMAIL_QUEUED, actorId, details: { toEmail: person.email } });
         }
@@ -104,7 +113,9 @@ export class PaymentsService {
       return {
         changed: toVerify.length,
         emailsQueued,
-        message: `Verified ${toVerify.length} participant(s); ${emailsQueued} QR email(s) go out in ${this.config.decisionEmailDelaySeconds}s unless undone`,
+        message:
+          `Verified ${toVerify.length} participant(s); ${emailsQueued} QR email(s) go out in ${this.config.decisionEmailDelaySeconds}s unless undone` +
+          (withoutEmail ? `; ${withoutEmail} without an email (QR pass created; it is emailed once an email is added)` : ''),
       };
     });
   }
@@ -147,7 +158,12 @@ export class PaymentsService {
       );
 
       const captain =
-        team.registrations.find((r) => r.person.email === team.captainEmail) ?? team.registrations[0];
+        (team.captainEmail && team.registrations.find((r) => r.person.email === team.captainEmail)) || team.registrations[0];
+      const captainEmail = captain.person.email;
+      // No email: the rejection is still recorded, but no undeliverable email is queued.
+      if (!captainEmail) {
+        return { changed: team.registrations.length, emailsQueued: 0, message: 'Rejected. No email was sent: the participant has no email' };
+      }
       const previous = await tx.emailOutbox.count({
         where: { idempotencyKey: { startsWith: `payment-rejected:${team.id}:` } },
       });
@@ -155,7 +171,7 @@ export class PaymentsService {
         [
           {
             idempotencyKey: `payment-rejected:${team.id}:${previous + 1}`,
-            toEmail: captain.person.email,
+            toEmail: captainEmail,
             personId: captain.personId,
             registrationId: captain.id,
             triggeredById: actorId,
@@ -177,7 +193,7 @@ export class PaymentsService {
       return {
         changed: team.registrations.length,
         emailsQueued,
-        message: `Rejected. ${captain.person.email} is emailed the reason in ${this.config.decisionEmailDelaySeconds}s`,
+        message: `Rejected. ${captainEmail} is emailed the reason in ${this.config.decisionEmailDelaySeconds}s`,
       };
     });
   }

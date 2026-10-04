@@ -83,8 +83,13 @@ enum ActivityType {
 
 model Person {
   id                String    @id @default(uuid()) @db.Uuid
-  /// Stored lowercased and trimmed; one person = one QR across all events.
-  email             String    @unique
+  /// Current (resolved) email: stored lowercased and trimmed; one person = one QR across all
+  /// events. Optional: a participant without a usable email is still registered, verified and
+  /// gets a QR token; emails are queued only once an address exists (see ParticipantsService).
+  email             String?   @unique
+  /// "<responseId>#<member position>" for a participant first created WITHOUT an email, so a
+  /// resync of that form row finds the same person instead of creating a duplicate.
+  sourceKey         String?   @unique
   name              String?
   phone             String?
   /// College name as last submitted (display); grouping uses collegeId.
@@ -241,6 +246,8 @@ model Registration {
   @@unique([eventSlug, personId])
   @@index([eventSlug, paymentStatus])
   @@index([insideSince])
+  /// "Ever entered" list: enteredAt is the first successful gate check-in, never cleared.
+  @@index([enteredAt])
   @@index([expectedArrivalDate])
   @@index([expectedDepartureDate])
   @@index([transactionId])

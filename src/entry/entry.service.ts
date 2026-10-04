@@ -146,7 +146,7 @@ export class EntryService {
       },
     });
     if (!reg) return null;
-    const who: GateSubject = { name: reg.person.name ?? reg.person.email, college: reg.person.college, eventSlug: reg.eventSlug };
+    const who: GateSubject = { name: reg.person.name ?? reg.person.email ?? 'Participant', college: reg.person.college, eventSlug: reg.eventSlug };
     return { ...reg, who };
   }
 

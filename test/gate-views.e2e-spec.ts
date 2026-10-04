@@ -116,11 +116,12 @@ describe('Sports events, dashboard views and manual gate (e2e)', () => {
       await seed();
       const all = await listed('');
       expect(all.names).toEqual(['Asha', 'Bala', 'Chitra', 'Dev', 'Esha', 'Farid']);
-      expect(all.counters).toEqual({ Total: 6, Verified: 4, Pending: 1, Rejected: 1, Blocked: 1, Inside: 1, Outside: 5 });
+      expect(all.counters).toEqual({ Total: 6, Verified: 4, Pending: 1, Rejected: 1, Blocked: 1, Inside: 1, Outside: 5, 'Ever entered': 2 });
 
       const views: [string, string[]][] = [
         ['inside', ['Asha']],
         ['outside', ['Bala', 'Chitra', 'Dev', 'Esha', 'Farid']],
+        ['entered', ['Asha', 'Bala']], // Bala checked out but has entered
         ['verified', ['Asha', 'Bala', 'Chitra', 'Esha']],
         ['pending', ['Dev']],
         ['rejected', ['Farid']],

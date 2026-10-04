@@ -8,6 +8,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ActivityEntry, recordActivity } from './activity';
 import { encryptAadhaar } from './aadhaar-crypto';
 import { collegeDisplayName, collegeNameKey } from './college';
+import { ParticipantsService, registrationReceivedKey } from './participants.service';
 
 export interface IngestSource {
   eventSlug: string;
@@ -57,6 +58,7 @@ export class RegistrationsService {
     private readonly prisma: PrismaService,
     private readonly outbox: EmailOutboxService,
     private readonly config: AppConfig,
+    private readonly participants: ParticipantsService,
   ) {}
 
   /**
@@ -98,6 +100,10 @@ export class RegistrationsService {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
         throw new RegistrationRetryableError('Concurrent submission for the same people; retry');
       }
+      // A lock conflict with a simultaneous staff action (verification / Change email); nothing was written.
+      if (error instanceof Prisma.PrismaClientKnownRequestError && (error.code === 'P2034' || /deadlock/i.test(error.message))) {
+        throw new RegistrationRetryableError('Concurrent staff action on the same people; retry');
+      }
       throw error;
     }
   }
@@ -116,7 +122,7 @@ export class RegistrationsService {
       for (const reg of team.registrations) {
         if (isLocked(reg)) {
           warnings.push(
-            `${reg.person.email} is no longer registered for ${this.config.eventName(team.eventSlug)} in the form but is already verified/entered; kept, fix manually`,
+            `${reg.person.email ?? 'A participant without an email'} is no longer registered for ${this.config.eventName(team.eventSlug)} in the form but is already verified/entered; kept, fix manually`,
           );
           continue;
         }
@@ -128,10 +134,12 @@ export class RegistrationsService {
   }
 
   /**
-   * Finds the person by email, or by a previous email (after a staff email change), so a
-   * resync of an old row never recreates the old address. Email itself is never overwritten.
+   * Finds the person by email, or by a previous email (after a staff email change), or, for a
+   * participant first created without an email, by this form row + member position (sourceKey),
+   * so a resync never creates a duplicate. An existing email is never overwritten; a person who
+   * has none adopts the row's email (then their pending emails are queued, see below).
    */
-  private async resolvePerson(tx: Prisma.TransactionClient, member: ParsedMember) {
+  private async resolvePerson(tx: Prisma.TransactionClient, member: ParsedMember, responseId: string) {
     let collegeId: string | undefined;
     if (member.college && collegeNameKey(member.college)) {
       const college = await tx.college.upsert({
@@ -156,11 +164,24 @@ export class RegistrationsService {
       photoDriveId: member.photoDriveId,
       idDocumentDriveId: member.idDocumentDriveId,
     };
+    const sourceKey = `${responseId}#${member.position}`;
     const existing =
-      (await tx.person.findUnique({ where: { email: member.email } })) ??
-      (await tx.personEmailAlias.findUnique({ where: { email: member.email }, include: { person: true } }))?.person;
-    if (existing) return tx.person.update({ where: { id: existing.id }, data: profile });
-    return tx.person.create({ data: { email: member.email, ...profile } });
+      (member.email
+        ? ((await tx.person.findUnique({ where: { email: member.email } })) ??
+          (await tx.personEmailAlias.findUnique({ where: { email: member.email }, include: { person: true } }))?.person)
+        : undefined) ?? (await tx.person.findUnique({ where: { sourceKey } }));
+    if (!existing) {
+      return { person: await tx.person.create({ data: { email: member.email, sourceKey: member.email ? undefined : sourceKey, ...profile } }), emailAdded: false };
+    }
+    let emailAdded = false;
+    if (!existing.email && member.email) {
+      // Same per-person lock as Change email and verification, and only while still empty, so a
+      // staff-entered email is never overwritten and the emails owed are queued exactly once.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'person-email:' + existing.id}))`;
+      emailAdded = (await tx.person.updateMany({ where: { id: existing.id, email: null }, data: { email: member.email } })).count === 1;
+    }
+    const person = await tx.person.update({ where: { id: existing.id }, data: profile });
+    return { person, emailAdded };
   }
 
   private async ingestInTx(
@@ -187,8 +208,11 @@ export class RegistrationsService {
     });
 
     const people = [];
+    const emailAdded: string[] = [];
     for (const member of members) {
-      people.push({ member, person: await this.resolvePerson(tx, member) });
+      const resolved = await this.resolvePerson(tx, member, responseId);
+      people.push({ member, person: resolved.person });
+      if (resolved.emailAdded) emailAdded.push(resolved.person.id);
     }
     const personIds = people.map((p) => p.person.id);
     if (new Set(personIds).size !== personIds.length) {
@@ -210,10 +234,10 @@ export class RegistrationsService {
       const otherTeam = reg.team ? `team "${reg.team.name}"` : 'another submission';
       if (isLocked(reg)) {
         errors.push(
-          `Member ${member.position} (${member.email}) is already registered for this event in ${otherTeam} with verified payment`,
+          `Member ${member.position} (${member.email ?? member.name}) is already registered for this event in ${otherTeam} with verified payment`,
         );
       } else {
-        warnings.push(`Member ${member.position} (${member.email}) moved here from ${otherTeam}`);
+        warnings.push(`Member ${member.position} (${member.email ?? member.name}) moved here from ${otherTeam}`);
       }
     }
     if (errors.length > 0) throw new RegistrationConflictError(errors);
@@ -232,7 +256,7 @@ export class RegistrationsService {
       });
       if (reg?.teamId === team.id && isLocked(reg)) {
         warnings.push(
-          `${old.person.email} was removed from the form but is already verified/entered; kept in the team, fix manually`,
+          `${old.person.email ?? 'A participant without an email'} was removed from the form but is already verified/entered; kept in the team, fix manually`,
         );
         continue;
       }
@@ -337,24 +361,44 @@ export class RegistrationsService {
     }
 
     const eventName = this.config.eventName(eventSlug);
-    const queuedEmails = await this.outbox.enqueue(
-      people.map(({ member, person }) => ({
-        idempotencyKey: `registration-received:${eventSlug}:${person.id}`,
-        personId: person.id,
-        registrationId: registrationIdByPerson.get(person.id),
-        toEmail: person.email,
-        subject: `Infinito 2K26: registration received for ${eventName}`,
-        template: EmailTemplate.RegistrationReceived,
-        payload: {
-          name: member.name,
-          eventName,
-          team: teamName,
-          isCaptain: member.isCaptain,
-          transactionId: transactionId ?? null,
-        },
-      })),
+    // Only people with an email: no job is created that could never be delivered. Someone who
+    // gets an email later is sent this same email then (same idempotency key, so never twice).
+    let queuedEmails = await this.outbox.enqueue(
+      people.flatMap(({ member, person }) =>
+        person.email
+          ? [
+              {
+                idempotencyKey: registrationReceivedKey(eventSlug, person.id),
+                personId: person.id,
+                registrationId: registrationIdByPerson.get(person.id),
+                toEmail: person.email,
+                subject: `Infinito 2K26: registration received for ${eventName}`,
+                template: EmailTemplate.RegistrationReceived,
+                payload: {
+                  name: member.name,
+                  eventName,
+                  team: teamName,
+                  isCaptain: member.isCaptain,
+                  transactionId: transactionId ?? null,
+                },
+              },
+            ]
+          : [],
+      ),
       tx,
     );
+    // The form row now carries an email for a participant who had none: their other events'
+    // registration emails and, if already verified, their QR passes go to it as well.
+    for (const personId of emailAdded) {
+      const to = people.find((p) => p.person.id === personId)?.person.email ?? null;
+      const regs = await tx.registration.findMany({ where: { personId }, select: { id: true } });
+      await recordActivity(
+        tx,
+        regs.map((r) => ({ registrationId: r.id, type: ActivityType.EMAIL_CHANGED, details: { from: null, to, source: 'form' } })),
+      );
+      const queued = await this.participants.queueEmailsForNewAddress(tx, personId);
+      queuedEmails += queued.registrationEmails + queued.qrEmails;
+    }
 
     this.logger.log(
       `${previousTeam ? 'Updated' : 'Created'} team ${team.id} (${eventSlug}/${responseId}), ${members.length} members, ${warnings.length} warnings`,

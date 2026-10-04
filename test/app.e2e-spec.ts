@@ -132,10 +132,13 @@ describe('Infinito registration system (e2e)', () => {
       await http.post('/webhooks/forms/submit').send({}).expect(401);
       await submit('r1', team2(), 'football', 'wrong-secret').expect(401);
       await http.post('/webhooks/forms/submit').set('X-Webhook-Secret', 'e2e-webhook-secret').send({ eventSlug: 'Bad Slug!' }).expect(400);
-      const invalid = await submit('r1', { 'Member 1 Name': 'A', 'Member 1 Email': 'not-an-email' }).expect(422);
-      // No transaction ID needed: verification is a manual dashboard step.
-      expect(invalid.body.errors).toEqual(['Member 1: "not-an-email" is not a valid email']);
+      await submit('r1', { 'Member 1 Email': 'a@example.com' }).expect(422); // a member needs a name
       expect(await prisma.person.count()).toBe(0);
+      // Email is optional: an invalid one is a warning, never a rejection (registered without email).
+      // No transaction ID needed: verification is a manual dashboard step.
+      const invalid = await submit('r1', { 'Member 1 Name': 'A', 'Member 1 Email': 'not-an-email' }).expect(200);
+      expect(invalid.body.warnings).toContain('Member 1: "not-an-email" is not a valid email; registered without an email');
+      expect((await prisma.person.findFirstOrThrow()).email).toBeNull();
     });
 
     it('matches titles regardless of case, spacing, "*" and ":" and slugifies the Sports answer', async () => {
