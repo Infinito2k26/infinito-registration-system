@@ -282,8 +282,26 @@ describe('Unique email, token-only QR and volunteer details (e2e)', () => {
       // The previews use the same protected route: nothing without a session.
       const anon = await ctx.http.get(`/staff/files/${reg.personId}/id`);
       expect([anon.status, anon.headers.location?.startsWith('/login')]).toEqual([303, true]);
-      // Coordinators' gate card is unchanged (no previews there).
-      expect((await getAs(ctx, coordinator, `/gate/${reg.id}`).expect(200)).text).not.toContain('doc-preview');
+      // Same scanned-participant page for every role; contents follow each role's existing permissions.
+      const admin = await staff(ctx, StaffRole.ADMIN);
+      const structure = (text: string) => [...text.matchAll(/<h[12][^>]*>([^<]+)</g)].map((m) => m[1]);
+      const pages = await Promise.all(
+        [admin, coordinator, volunteer].map(async (who) => (await getAs(ctx, who, `/p/${reg.person.qrToken}`).expect(200)).text),
+      );
+      const [adminPage, coordinatorPage, volunteerPage] = pages;
+      expect(structure(adminPage)).toEqual(structure(volunteerPage));
+      expect(structure(coordinatorPage)).toEqual(structure(volunteerPage));
+      const preview = (kind: string) => `<a class="doc-preview" href="/staff/files/${reg.personId}/${kind}"`;
+      for (const text of pages) expect(text).toContain(preview('id')); // College ID: every role
+      for (const text of [adminPage, volunteerPage]) {
+        expect(text).toContain(preview('aadhaar'));
+        expect(text).toContain('1234 5678 9012');
+      }
+      // Coordinators: still last 4 digits only and no Aadhaar card.
+      expect(coordinatorPage).not.toContain('/aadhaar');
+      expect(coordinatorPage).not.toContain('1234 5678');
+      expect(coordinatorPage).toContain('XXXX XXXX 9012');
+      for (const text of pages) expect(text).not.toContain('v1:');
       const file = await getAs(ctx, volunteer, `/staff/files/${reg.personId}/aadhaar`).expect(200);
       expect(file.headers['content-type']).toBe('image/png');
       // Coordinators keep their existing access: last 4 digits, no Aadhaar image.

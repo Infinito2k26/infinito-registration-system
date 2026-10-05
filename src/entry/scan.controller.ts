@@ -23,7 +23,7 @@ import { DriveService } from '../drive/drive.service';
 import { QrEmailError, QrEmailService } from '../emails/qr-email.service';
 import { PaymentActionError, PaymentsService } from '../payments/payments.service';
 import { extractQrToken } from '../qr/qr-token';
-import { volunteerDetails } from '../admin/admin.views';
+import { scanDetails } from '../admin/admin.views';
 import { decryptAadhaar, formatAadhaar, maskAadhaar } from '../registrations/aadhaar-crypto';
 import { ParticipantActionError, ParticipantsService, changeEmailMessage } from '../registrations/participants.service';
 import { setFlash, takeFlash } from '../web/cookies';
@@ -335,7 +335,7 @@ export class ScanController {
   /**
    * The gate card: photo, name, college and, per event, the one action the current state allows.
    * Checks shown in the server's order: verified -> not blocked -> IN/OUT state.
-   * For a VOLUNTEER it is also their participant view, with the full details (incl. Aadhaar).
+   * Below it, the same participant details for every role (contents per role permissions).
    */
   private async sendGateCard(
     req: StaffRequest,
@@ -348,14 +348,21 @@ export class ScanController {
     const csrf = this.auth.csrfToken(staff.sessionId);
     const manage = staff.role !== StaffRole.VOLUNTEER;
     const canVerify = this.canVerify(req);
-    const volunteer = staff.role === StaffRole.VOLUNTEER;
-    // Volunteers see the full Aadhaar here: decrypted on the server for this signed-in request
-    // only. The encrypted value itself is never rendered, for any role.
-    const aadhaarFull = volunteer ? decryptAadhaar(person.aadhaarEncrypted, this.config.aadhaarKey) : null;
+    // Full Aadhaar number and Aadhaar card: admins and volunteers (existing permissions), never
+    // coordinators. Decrypted on the server for this signed-in request only; the encrypted
+    // value itself is never rendered, for any role.
+    const aadhaarAccess = staff.role === StaffRole.ADMIN || staff.role === StaffRole.VOLUNTEER;
+    const aadhaarFull = aadhaarAccess ? decryptAadhaar(person.aadhaarEncrypted, this.config.aadhaarKey) : null;
     person.aadhaarEncrypted = null;
-    const details = volunteer
-      ? volunteerDetails({ person, aadhaarFull, history: await this.entry.historyFor(person.id), eventName: this.eventName, driveEnabled: this.drive.enabled })
-      : null;
+    // The same details section (and document previews) for every role.
+    const details = scanDetails({
+      person,
+      aadhaarFull,
+      aadhaarAccess,
+      history: await this.entry.historyFor(person.id),
+      eventName: this.eventName,
+      driveEnabled: this.drive.enabled,
+    });
     const photo =
       this.drive.enabled && person.photoDriveId
         ? html`<img class="photo" src="/staff/files/${person.id}/photo" alt="Photo of ${person.name}">`

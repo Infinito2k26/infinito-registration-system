@@ -591,11 +591,12 @@ export function participantPage(args: {
 }
 
 /**
- * Full participant details for a VOLUNTEER's participant view (the gate card): everything the
- * participant page shows, read-only. Rendered on the server only after StaffGuard has
- * authorised the signed-in volunteer; `aadhaarFull` is decrypted for that request only.
+ * Participant details on the scanned-participant page (gate card), the same section for every
+ * staff role. What it contains follows each role's existing permissions: `aadhaarAccess` (full
+ * Aadhaar number + Aadhaar card) is true for admins and volunteers only; `aadhaarFull` is
+ * decrypted on the server for that signed-in request only.
  */
-export function volunteerDetails(args: {
+export function scanDetails(args: {
   person: {
     id: string;
     name: string | null;
@@ -632,6 +633,7 @@ export function volunteerDetails(args: {
     }[];
   };
   aadhaarFull: string | null;
+  aadhaarAccess: boolean;
   history: {
     entryLogs: { id: string; eventSlug: string; kind: EntryKind; status: string; notes: string | null; gate: string | null; enteredAt: Date; volunteer: { name: string | null; email: string } | null }[];
     activity: { id: string; type: ActivityType; details: unknown; createdAt: Date; actor: { name: string | null; email: string } | null; registration: { eventSlug: string } }[];
@@ -666,10 +668,10 @@ export function volunteerDetails(args: {
         args.aadhaarFull
           ? html`<dt>Aadhaar</dt><dd class="mono">${formatAadhaar(args.aadhaarFull)}</dd>`
           : p.aadhaarLast4
-            ? html`<dt>Aadhaar</dt><dd class="mono">${maskAadhaar(p.aadhaarLast4)} <span class="muted small">(only the last 4 digits are on file)</span></dd>`
+            ? html`<dt>Aadhaar</dt><dd class="mono">${maskAadhaar(p.aadhaarLast4)}${args.aadhaarAccess ? html` <span class="muted small">(only the last 4 digits are on file)</span>` : null}</dd>`
             : null
       }
-      <dt>Aadhaar card</dt><dd>${file('aadhaar', p.aadhaarDriveId, 'View Aadhaar card')}</dd>
+      ${args.aadhaarAccess ? html`<dt>Aadhaar card</dt><dd>${file('aadhaar', p.aadhaarDriveId, 'View Aadhaar card')}</dd>` : null}
       <dt>Gate access</dt><dd>${p.blockedAt ? html`${badge('BLOCKED', 'bad')} since ${fmtDate(p.blockedAt)}${p.blockReason ? html`<br>Reason: ${p.blockReason}` : null}` : 'Not blocked'}</dd>
       <dt>QR pass</dt><dd>${p.qrToken ? 'created' : html`<span class="muted">created on verification</span>`}</dd>
     </dl>
