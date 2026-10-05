@@ -168,10 +168,10 @@ describe('Individual form workflow (e2e)', () => {
           await ctx.worker.processBatch();
         }
         expect(fake.sent.filter((e) => e.subject.startsWith('Your Infinito 2K26 entry pass'))).toHaveLength(6); // 1 automatic + 5 manual
-        const urls = new Set(
-          (await qrRows('priya@example.com')).map((e) => (e.payload as { qrUrl: string }).qrUrl),
+        const tokens = new Set(
+          (await qrRows('priya@example.com')).map((e) => (e.payload as { qrToken: string }).qrToken),
         );
-        expect(urls).toEqual(new Set([`http://e2e.test/p/${r.person.qrToken}`]));
+        expect(tokens).toEqual(new Set([r.person.qrToken]));
         expect((await reg('priya@example.com')).person.qrToken).toBe(r.person.qrToken);
         expect(await ctx.prisma.registrationActivity.count({ where: { registrationId: r.id, type: 'QR_EMAIL_RESENT' } })).toBe(5);
         const page = await getAs(ctx, coordinator, `/admin/registrations/${r.id}`).expect(200);
@@ -231,7 +231,7 @@ describe('Individual form workflow (e2e)', () => {
       await postAs(ctx, coordinator, `/admin/registrations/${after.id}/resend-qr`);
       const newest = (await ctx.prisma.emailOutbox.findMany({ where: { template: EmailTemplate.QrPass }, orderBy: { createdAt: 'desc' } }))[0];
       expect(newest.toEmail).toBe('priya.new@example.com');
-      expect((newest.payload as { qrUrl: string }).qrUrl).toBe(`http://e2e.test/p/${before.person.qrToken}`);
+      expect((newest.payload as { qrToken: string }).qrToken).toBe(before.person.qrToken);
 
       // The sheet still has the old email: resync maps to the same person and keeps the new email.
       await submitRow(ctx, 'r1', row({ name: 'Priya', email: 'priya@example.com', college: 'NIT Patna' })).expect(200);
@@ -248,8 +248,8 @@ describe('Individual form workflow (e2e)', () => {
       expect(flash(await postAs(ctx, coordinator, `/admin/registrations/${priya.id}/change-email`, { email: 'not-an-email' }))).toBe(
         '"not-an-email" is not a valid email',
       );
-      expect(flash(await postAs(ctx, coordinator, `/admin/registrations/${priya.id}/change-email`, { email: 'ARJUN@example.com' }))).toMatch(
-        /^arjun@example.com already belongs to another participant/,
+      expect(flash(await postAs(ctx, coordinator, `/admin/registrations/${priya.id}/change-email`, { email: 'ARJUN@example.com' }))).toBe(
+        'This email address is already registered to another participant.',
       );
       expect(await ctx.prisma.person.count()).toBe(2);
       expect((await reg('priya@example.com')).person.email).toBe('priya@example.com');
@@ -308,7 +308,7 @@ describe('Individual form workflow (e2e)', () => {
       expect(byTo['arjun@nitp.test'].status).toBe(EmailStatus.FAILED);
       for (const email of ['priya@nitp.test', 'arjun@nitp.test']) {
         const person = await ctx.prisma.person.findUniqueOrThrow({ where: { email } });
-        expect((byTo[email].payload as { qrUrl: string }).qrUrl).toBe(`http://e2e.test/p/${person.qrToken}`);
+        expect((byTo[email].payload as { qrToken: string }).qrToken).toBe(person.qrToken);
       }
       const page = await getAs(ctx, coordinator, `/admin/colleges/${nit.id}`).expect(200);
       expect(page.text).toContain('Each student, own email');
@@ -331,10 +331,10 @@ describe('Individual form workflow (e2e)', () => {
       expect(mails).toHaveLength(1);
       expect(mails[0].toEmail).toBe('priya@nitp.test');
       const passes = (mails[0].payload as unknown as { passes: CollegePass[] }).passes;
-      expect(passes.map((p) => [p.name, p.qrUrl]).sort()).toEqual(
+      expect(passes.map((p) => [p.name, p.qrToken]).sort()).toEqual(
         [
-          ['Arjun', `http://e2e.test/p/${arjun.qrToken}`],
-          ['Priya', `http://e2e.test/p/${priya.qrToken}`],
+          ['Arjun', arjun.qrToken],
+          ['Priya', priya.qrToken],
         ].sort(),
       );
       expect(JSON.stringify(mails[0].payload)).not.toMatch(/Zoya|Meera|Kabir/);
@@ -468,18 +468,14 @@ describe('Individual form workflow (e2e)', () => {
       for (const path of [`/admin/registrations/${r.id}`, '/admin/colleges', `/admin/colleges/${college.id}`]) {
         await getAs(ctx, volunteer, path).expect(403);
       }
-      await getAs(ctx, volunteer, `/staff/files/${r.personId}/aadhaar`).expect(403);
       expect((await reg('priya@nitp.test')).person.email).toBe('priya@nitp.test');
       expect(await ctx.prisma.emailBatch.count()).toBe(0);
 
-      // The gate page shows only what the gate needs.
+      // Volunteers (trusted event staff) see the full participant details on their participant view.
       const pass = await getAs(ctx, volunteer, `/p/${r.person.qrToken}`).expect(200);
-      expect(pass.text).toContain('Priya');
-      expect(pass.text).toContain('NIT Patna');
-      for (const secret of ['priya@nitp.test', '9876500000', '5678', '1234 5678', 'R-Priya', '/aadhaar', 'Vegetarian']) {
-        expect(pass.text).not.toContain(secret);
+      for (const shown of ['Priya', 'NIT Patna', 'priya@nitp.test', '9876500000', '1234 5678 9012', 'R-Priya', 'Aadhaar card', 'Vegetarian']) {
+        expect([shown, pass.text.includes(shown)]).toEqual([shown, true]);
       }
-      expect(pass.text).toContain('XXXX XXXX 9012'); // Aadhaar: last 4 digits only
     });
 
     it('coordinators see the full participant page (Aadhaar masked) but not staff management', async () => {

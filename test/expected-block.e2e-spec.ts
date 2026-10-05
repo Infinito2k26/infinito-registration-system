@@ -219,7 +219,8 @@ describe('Expected dates, QR IN/OUT and blocking (e2e)', () => {
       expect(pass.text).toContain('Please contact the coordinator/admin');
       expect(pass.text).not.toContain('MARK ENTERED');
       expect(pass.text).not.toContain('CHECK OUT');
-      expect(pass.text).not.toContain('Registration issue'); // the reason is internal
+      // The gate verdict itself never states the reason; volunteers see it in the participant details.
+      expect(pass.text.match(/<div class="verdict verdict-bad">[\s\S]*?<\/div>/)?.[0]).not.toContain('Registration issue');
 
       const refused = 'ACCESS BLOCKED: registration access has been blocked. Please contact the coordinator/admin.';
       expect(flash(await enter(blocked))).toBe(refused);

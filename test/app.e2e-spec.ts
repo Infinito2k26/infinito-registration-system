@@ -420,9 +420,9 @@ describe('Infinito registration system (e2e)', () => {
       const tokenBefore = asha.person.qrToken!;
       const [ashaPass, raviPass] = (await qrRows(id))
         .sort((a, b) => a.toEmail.localeCompare(b.toEmail))
-        .map((r) => (r.payload as { qrUrl: string }).qrUrl);
-      expect(ashaPass).toBe(`http://e2e.test/p/${tokenBefore}`);
-      expect(raviPass).toBe(`http://e2e.test/p/${ravi.person.qrToken}`);
+        .map((r) => (r.payload as { qrToken: string }).qrToken);
+      expect(ashaPass).toBe(tokenBefore);
+      expect(raviPass).toBe(ravi.person.qrToken);
 
       // 5 simultaneous clicks: one resend is queued, the rest are refused.
       const clicks = await Promise.all(Array.from({ length: 5 }, () => postAs(coordinator, `/admin/registrations/${asha.id}/resend-qr`)));
@@ -437,7 +437,7 @@ describe('Infinito registration system (e2e)', () => {
 
       const ashaRows = (await qrRows(id)).filter((r) => r.toEmail === 'asha@example.com');
       expect(ashaRows.map((r) => r.status)).toEqual([EmailStatus.SENT, EmailStatus.SENT, EmailStatus.SENT]);
-      expect(new Set(ashaRows.map((r) => (r.payload as { qrUrl: string }).qrUrl))).toEqual(new Set([ashaPass]));
+      expect(new Set(ashaRows.map((r) => (r.payload as { qrToken: string }).qrToken))).toEqual(new Set([ashaPass]));
       expect(ashaRows.slice(1).every((r) => r.triggeredById === coordinator.id)).toBe(true);
       expect((await regOf('asha@example.com')).person.qrToken).toBe(tokenBefore);
       expect(await prisma.registration.count()).toBe(2);
@@ -480,7 +480,7 @@ describe('Infinito registration system (e2e)', () => {
   // ---------- gate ----------
 
   describe('gate entry', () => {
-    it('anonymous visitors see no participant data; volunteers see only what the gate needs', async () => {
+    it('anonymous visitors see no participant data; volunteers see the full participant details', async () => {
       await verifiedTeam();
       const asha = await regOf('asha@example.com');
       const anon = await http.get(`/p/${asha.person.qrToken}`).expect(200);
@@ -493,9 +493,8 @@ describe('Infinito registration system (e2e)', () => {
       expect(pass.text).toContain('<h1>Asha Rao</h1>');
       expect(pass.text).toContain('Team Byte Me');
       expect(pass.text).toContain('MARK ENTERED');
-      for (const secret of ['asha@example.com', '9876543210', 'UTR111', '/admin/teams/']) {
-        expect(pass.text).not.toContain(secret);
-      }
+      for (const shown of ['asha@example.com', '9876543210', 'UTR111']) expect([shown, pass.text.includes(shown)]).toEqual([shown, true]);
+      expect(pass.text).not.toContain('/admin/teams/'); // no coordinator pages
       await getAs(volunteer, '/p/NOT-A-REAL-TOKEN-AAAAAAAAAAAAAAAA').expect(404);
     });
 

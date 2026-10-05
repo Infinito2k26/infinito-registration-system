@@ -86,6 +86,8 @@ model Person {
   /// Current (resolved) email: stored lowercased and trimmed; one person = one QR across all
   /// events. Optional: a participant without a usable email is still registered, verified and
   /// gets a QR token; emails are queued only once an address exists (see ParticipantsService).
+  /// Also unique case-insensitively: index "Person_email_lower_key" on lower(email), created in
+  /// migration 20261007090000 (Prisma cannot express expression indexes here).
   email             String?   @unique
   /// "<responseId>#<member position>" for a participant first created WITHOUT an email, so a
   /// resync of that form row finds the same person instead of creating a duplicate.

@@ -135,25 +135,23 @@ describe('Role-based access control (e2e)', () => {
   // ---------- VOLUNTEER ----------
 
   describe('VOLUNTEER', () => {
-    it('has Scan and a gate-safe participant profile (Aadhaar last 4, College ID, no private data)', async () => {
+    it('has Scan and a full participant profile (full Aadhaar, Aadhaar card, College ID, contact details)', async () => {
       await verify();
       await getAs(ctx, volunteer, '/scan').expect(200);
       const profile = await page(volunteer, `/gate/${regId}`);
       expect(profile.status).toBe(200);
-      expect(profile.text).toContain('Priya');
-      expect(profile.text).toContain('XXXX XXXX 9012');
-      expect(profile.text).toContain(`/staff/files/${personId}/id`);
-      for (const secret of ['5678', '/aadhaar', 'priya@example.com', '9876500000', '2201CS42', 'v1:']) {
-        expect([secret, profile.text.includes(secret)]).toEqual([secret, false]);
+      for (const shown of ['Priya', '1234 5678 9012', `/staff/files/${personId}/id`, `/staff/files/${personId}/aadhaar`, 'priya@example.com', '9876500000', '2201CS42']) {
+        expect([shown, profile.text.includes(shown)]).toEqual([shown, true]);
       }
-      await getAs(ctx, volunteer, `/staff/files/${personId}/aadhaar`).expect(403);
+      expect(profile.text).not.toContain('v1:'); // the encrypted value itself is never rendered
+      await getAs(ctx, volunteer, `/staff/files/${personId}/aadhaar`).expect(200);
       await getAs(ctx, volunteer, `/staff/files/${personId}/id`).expect(200);
     });
 
-    it('can send the participant their own QR email (individual only); address is masked', async () => {
+    it('can send the participant their own QR email (individual only)', async () => {
       await verify();
       await ctx.worker.processBatch();
-      expect(flash(await postAs(ctx, volunteer, `/gate/${regId}/send-qr`))).toBe('QR email queued to p•••@example.com');
+      expect(flash(await postAs(ctx, volunteer, `/gate/${regId}/send-qr`))).toBe('QR email queued to priya@example.com');
       const last = await ctx.prisma.emailOutbox.findFirstOrThrow({ where: { template: EmailTemplate.QrPass, triggeredById: volunteer.id } });
       expect(last.toEmail).toBe('priya@example.com');
     });
@@ -202,7 +200,6 @@ describe('Role-based access control (e2e)', () => {
         '/admin/arrivals', // expected arrivals
         '/admin/departures',
         '/admin/staff',
-        `/staff/files/${personId}/aadhaar`,
       ];
       for (const path of gets) {
         expect([path, (await getAs(ctx, volunteer, path)).status]).toEqual([path, 403]);
@@ -237,17 +234,17 @@ describe('Role-based access control (e2e)', () => {
       expect([byName.text.includes('>Arjun</a>'), byName.text.includes('>Priya</a>')]).toEqual([true, false]);
     });
 
-    it('opens a participant from the list: allowed info only, email masked', async () => {
+    it('opens a participant from the list: full details, but no coordinator actions', async () => {
       await verify();
       const list = await page(volunteer, '/scan/find');
       expect(list.text).toContain(`data-href="/gate/${regId}"`);
       const profile = await page(volunteer, `/gate/${regId}`);
       expect(profile.status).toBe(200);
-      for (const shown of ['Priya', 'NIT Patna', 'TT', 'XXXX XXXX 9012', `/staff/files/${personId}/id`, 'Email p•••@example.com', 'Change email', 'Send QR email']) {
+      for (const shown of ['Priya', 'NIT Patna', 'TT', '1234 5678 9012', `/staff/files/${personId}/id`, 'Email priya@example.com', 'Change email', 'Send QR email']) {
         expect([shown, profile.text.includes(shown)]).toEqual([shown, true]);
       }
-      for (const secret of ['priya@example.com', '9876500000', '2201CS42', '5678', '/aadhaar', 'Block participant', 'Unblock']) {
-        expect([secret, profile.text.includes(secret)]).toEqual([secret, false]);
+      for (const action of ['Block participant', 'Unblock', '/admin/registrations/']) {
+        expect([action, profile.text.includes(action)]).toEqual([action, false]);
       }
     });
 
@@ -255,7 +252,7 @@ describe('Role-based access control (e2e)', () => {
       await verify();
       const before = await ctx.prisma.person.findUniqueOrThrow({ where: { id: personId } });
       expect(flash(await postAs(ctx, volunteer, `/gate/${regId}/change-email`, { email: ' Priya.New@Example.com ' }))).toBe(
-        'Email changed from p•••@example.com to priya.new@example.com. No email was sent; use Send QR email if needed.',
+        'Email changed from priya@example.com to priya.new@example.com. No email was sent; use Send QR email if needed.',
       );
       const after = await ctx.prisma.registration.findUniqueOrThrow({ where: { id: regId }, include: { person: true } });
       expect(after.personId).toBe(personId);
@@ -268,7 +265,7 @@ describe('Role-based access control (e2e)', () => {
       expect(flash(await postAs(ctx, volunteer, `/gate/${regId}/change-email`, { email: 'nope' }))).toBe('"nope" is not a valid email');
       // The QR email then goes to the new address.
       await ctx.worker.processBatch();
-      expect(flash(await postAs(ctx, volunteer, `/gate/${regId}/send-qr`))).toBe('QR email queued to p•••@example.com');
+      expect(flash(await postAs(ctx, volunteer, `/gate/${regId}/send-qr`))).toBe('QR email queued to priya.new@example.com');
       const last = await ctx.prisma.emailOutbox.findFirstOrThrow({ where: { triggeredById: volunteer.id, template: EmailTemplate.QrPass } });
       expect(last.toEmail).toBe('priya.new@example.com');
     });

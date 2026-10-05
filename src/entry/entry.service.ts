@@ -119,6 +119,26 @@ export class EntryService {
     return { rows, total };
   }
 
+  /**
+   * Gate log and history of one participant (all events), for the volunteer's participant
+   * view: the same records the participant page shows to coordinators/admins.
+   */
+  async historyFor(personId: string) {
+    const [entryLogs, activity] = await Promise.all([
+      this.prisma.entryLog.findMany({
+        where: { personId },
+        orderBy: { enteredAt: 'desc' },
+        include: { volunteer: { select: { name: true, email: true } } },
+      }),
+      this.prisma.registrationActivity.findMany({
+        where: { registration: { personId } },
+        orderBy: { createdAt: 'desc' },
+        include: { actor: { select: { name: true, email: true } }, registration: { select: { eventSlug: true } } },
+      }),
+    ]);
+    return { entryLogs, activity };
+  }
+
   private lookupPerson(where: Prisma.PersonWhereUniqueInput) {
     return this.prisma.person.findUnique({
       where,
