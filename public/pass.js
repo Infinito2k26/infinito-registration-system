@@ -20,8 +20,11 @@
   });
   // Document previews: a file that is not an image (e.g. a PDF) is left to its "View ..." link.
   document.querySelectorAll('.doc-preview img').forEach(function (img) {
-    img.addEventListener('error', function () {
+    function hide() {
       img.parentNode.hidden = true;
-    });
+    }
+    // Already failed before this script ran (a lazy image not yet requested has no currentSrc).
+    if (img.complete && img.currentSrc && img.naturalWidth === 0) hide();
+    else img.addEventListener('error', hide);
   });
 })();
