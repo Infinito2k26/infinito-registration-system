@@ -272,7 +272,18 @@ describe('Unique email, token-only QR and volunteer details (e2e)', () => {
           expect([path, shown, text.includes(shown)]).toEqual([path, shown, true]);
         }
         expect(text).not.toContain('v1:'); // the encrypted Aadhaar is never rendered
+        // Both documents are already visible as previews (no click needed); clicking opens them full size.
+        for (const kind of ['id', 'aadhaar']) {
+          const url = `/staff/files/${reg.personId}/${kind}`;
+          expect(text).toContain(`<a class="doc-preview" href="${url}" target="_blank" rel="noopener"><img src="${url}"`);
+        }
+        expect(text.match(/loading="lazy"/g)).toHaveLength(2);
       }
+      // The previews use the same protected route: nothing without a session.
+      const anon = await ctx.http.get(`/staff/files/${reg.personId}/id`);
+      expect([anon.status, anon.headers.location?.startsWith('/login')]).toEqual([303, true]);
+      // Coordinators' gate card is unchanged (no previews there).
+      expect((await getAs(ctx, coordinator, `/gate/${reg.id}`).expect(200)).text).not.toContain('doc-preview');
       const file = await getAs(ctx, volunteer, `/staff/files/${reg.personId}/aadhaar`).expect(200);
       expect(file.headers['content-type']).toBe('image/png');
       // Coordinators keep their existing access: last 4 digits, no Aadhaar image.
