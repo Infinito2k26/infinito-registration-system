@@ -642,11 +642,13 @@ export function volunteerDetails(args: {
   const { person: p, history, eventName } = args;
   const fact = (label: string, value: unknown) =>
     value === null || value === undefined || value === '' ? null : html`<dt>${label}</dt><dd>${String(value)}</dd>`;
+  // The document is shown as a preview (loaded when scrolled to); the link and the preview open it full size.
   const file = (kind: 'id' | 'aadhaar', id: string | null, label: string) =>
     !args.driveEnabled
       ? html`<span class="muted">Drive not configured</span>`
       : id
-        ? html`<a href="/staff/files/${p.id}/${kind}" target="_blank" rel="noopener">${label}</a>`
+        ? html`<a href="/staff/files/${p.id}/${kind}" target="_blank" rel="noopener">${label}</a>
+            <a class="doc-preview" href="/staff/files/${p.id}/${kind}" target="_blank" rel="noopener"><img src="/staff/files/${p.id}/${kind}" alt="${label}" loading="lazy"></a>`
         : html`<span class="muted">not uploaded</span>`;
   const planned = (date: Date | null, text: string | null) =>
     date ? fmtDay(date) : html`<span class="muted">${text ? `"${text}" (not a date)` : 'not given'}</span>`;

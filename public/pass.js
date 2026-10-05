@@ -18,4 +18,10 @@
       }
     });
   });
+  // Document previews: a file that is not an image (e.g. a PDF) is left to its "View ..." link.
+  document.querySelectorAll('.doc-preview img').forEach(function (img) {
+    img.addEventListener('error', function () {
+      img.parentNode.hidden = true;
+    });
+  });
 })();
