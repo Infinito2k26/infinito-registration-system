@@ -20,7 +20,7 @@ import { DriveService } from './drive.service';
 
 /**
  * Participant files. Photo and college ID card: any signed-in staff (volunteers check them at
- * the gate). Aadhaar card: admins only.
+ * the gate). Aadhaar card: admins and volunteers (not coordinators).
  */
 @Controller('staff/files')
 @UseGuards(StaffGuard)
@@ -39,9 +39,10 @@ export class DriveController {
     @Res() res: Response,
   ) {
     if (kind !== 'photo' && kind !== 'id' && kind !== 'aadhaar') throw new NotFoundException();
-    // Aadhaar images: ADMIN only, checked on every request (a copied link doesn't help anyone else).
-    if (kind === 'aadhaar' && req.staff!.role !== StaffRole.ADMIN) {
-      throw new ForbiddenException('Aadhaar documents are only available to admins');
+    // Aadhaar images: ADMIN and VOLUNTEER only, checked on every request (a copied link doesn't
+    // help anyone without such a session).
+    if (kind === 'aadhaar' && req.staff!.role !== StaffRole.ADMIN && req.staff!.role !== StaffRole.VOLUNTEER) {
+      throw new ForbiddenException('Aadhaar documents are only available to admins and volunteers');
     }
     const person = await this.prisma.person.findUnique({
       where: { id: personId },

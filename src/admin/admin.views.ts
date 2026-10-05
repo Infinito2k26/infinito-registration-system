@@ -590,6 +590,129 @@ export function participantPage(args: {
   </section>`;
 }
 
+/**
+ * Full participant details for a VOLUNTEER's participant view (the gate card): everything the
+ * participant page shows, read-only. Rendered on the server only after StaffGuard has
+ * authorised the signed-in volunteer; `aadhaarFull` is decrypted for that request only.
+ */
+export function volunteerDetails(args: {
+  person: {
+    id: string;
+    name: string | null;
+    email: string | null;
+    emailBouncedAt: Date | null;
+    emailBounceReason: string | null;
+    phone: string | null;
+    college: string | null;
+    rollNumber: string | null;
+    aadhaarLast4: string | null;
+    aadhaarDriveId: string | null;
+    idDocumentDriveId: string | null;
+    qrToken: string | null;
+    blockedAt: Date | null;
+    blockReason: string | null;
+    registrations: {
+      id: string;
+      eventSlug: string;
+      paymentStatus: PaymentStatus;
+      paymentRemarks: string | null;
+      paymentReviewedAt: Date | null;
+      transactionId: string | null;
+      accommodation: string | null;
+      accommodationPeriod: string | null;
+      expectedArrivalText: string | null;
+      expectedDepartureText: string | null;
+      expectedArrivalDate: Date | null;
+      expectedDepartureDate: Date | null;
+      remark: string | null;
+      insideSince: Date | null;
+      enteredAt: Date | null;
+      lastCheckInAt: Date | null;
+      lastCheckOutAt: Date | null;
+    }[];
+  };
+  aadhaarFull: string | null;
+  history: {
+    entryLogs: { id: string; eventSlug: string; kind: EntryKind; status: string; notes: string | null; gate: string | null; enteredAt: Date; volunteer: { name: string | null; email: string } | null }[];
+    activity: { id: string; type: ActivityType; details: unknown; createdAt: Date; actor: { name: string | null; email: string } | null; registration: { eventSlug: string } }[];
+  };
+  eventName: EventName;
+  driveEnabled: boolean;
+}): SafeHtml {
+  const { person: p, history, eventName } = args;
+  const fact = (label: string, value: unknown) =>
+    value === null || value === undefined || value === '' ? null : html`<dt>${label}</dt><dd>${String(value)}</dd>`;
+  const file = (kind: 'id' | 'aadhaar', id: string | null, label: string) =>
+    !args.driveEnabled
+      ? html`<span class="muted">Drive not configured</span>`
+      : id
+        ? html`<a href="/staff/files/${p.id}/${kind}" target="_blank" rel="noopener">${label}</a>`
+        : html`<span class="muted">not uploaded</span>`;
+  const planned = (date: Date | null, text: string | null) =>
+    date ? fmtDay(date) : html`<span class="muted">${text ? `"${text}" (not a date)` : 'not given'}</span>`;
+
+  return html`<section class="card">
+    <h2>Participant details</h2>
+    <dl class="facts">
+      ${fact('Full name', p.name)}
+      <dt>Email</dt><dd>${p.email ?? html`<span class="muted">No email</span>`}${p.emailBouncedAt ? html` ${badge('bounced', 'bad')} <span class="error-text">${p.emailBounceReason}</span>` : null}</dd>
+      ${fact('Mobile', p.phone)}
+      ${fact('College', p.college)}
+      ${fact('College roll no.', p.rollNumber)}
+      <dt>College ID card</dt><dd>${file('id', p.idDocumentDriveId, 'View College ID card')}</dd>
+      ${
+        args.aadhaarFull
+          ? html`<dt>Aadhaar</dt><dd class="mono">${formatAadhaar(args.aadhaarFull)}</dd>`
+          : p.aadhaarLast4
+            ? html`<dt>Aadhaar</dt><dd class="mono">${maskAadhaar(p.aadhaarLast4)} <span class="muted small">(only the last 4 digits are on file)</span></dd>`
+            : null
+      }
+      <dt>Aadhaar card</dt><dd>${file('aadhaar', p.aadhaarDriveId, 'View Aadhaar card')}</dd>
+      <dt>Gate access</dt><dd>${p.blockedAt ? html`${badge('BLOCKED', 'bad')} since ${fmtDate(p.blockedAt)}${p.blockReason ? html`<br>Reason: ${p.blockReason}` : null}` : 'Not blocked'}</dd>
+      <dt>QR pass</dt><dd>${p.qrToken ? 'created' : html`<span class="muted">created on verification</span>`}</dd>
+    </dl>
+  </section>
+  ${p.registrations.map(
+    (reg) => html`<section class="card">
+      <h2>${eventName(reg.eventSlug)}: details</h2>
+      <dl class="facts">
+        <dt>Sport / event</dt><dd>${eventName(reg.eventSlug)}</dd>
+        <dt>Verification</dt><dd>${paymentBadge(reg.paymentStatus)}${reg.paymentReviewedAt ? html` ${fmtDate(reg.paymentReviewedAt)}` : null}</dd>
+        ${fact('Rejection reason', reg.paymentRemarks)}
+        ${fact('Transaction ID', reg.transactionId)}
+        <dt>Expected arrival</dt><dd>${planned(reg.expectedArrivalDate, reg.expectedArrivalText)} <span class="muted small">(planned, from the form)</span></dd>
+        <dt>Expected departure</dt><dd>${planned(reg.expectedDepartureDate, reg.expectedDepartureText)} <span class="muted small">(planned, from the form)</span></dd>
+        ${fact('Accommodation', reg.accommodation)}
+        ${fact('Accommodation period', reg.accommodationPeriod)}
+        ${fact('Remark', reg.remark)}
+        <dt>Now</dt><dd>${presenceBadge(reg)}${reg.insideSince ? html` since ${fmtExact(reg.insideSince)}` : null}</dd>
+        <dt>Actual check-in</dt><dd>${reg.lastCheckInAt ? fmtExact(reg.lastCheckInAt) : html`<span class="muted">Not yet</span>`}${reg.enteredAt && reg.lastCheckInAt && reg.enteredAt.getTime() !== reg.lastCheckInAt.getTime() ? html` <span class="muted small">(first entry ${fmtExact(reg.enteredAt)})</span>` : null}</dd>
+        <dt>Actual check-out</dt><dd>${reg.lastCheckOutAt ? fmtExact(reg.lastCheckOutAt) : html`<span class="muted">Not yet</span>`}</dd>
+      </dl>
+    </section>`,
+  )}
+  ${
+    history.entryLogs.length
+      ? html`<section class="card">
+          <h2>Gate log</h2>
+          <div class="table-wrap"><table class="table small"><thead><tr><th>Time</th><th>Event</th><th>Action</th><th>Result</th><th>Gate</th><th>Staff</th></tr></thead><tbody>
+          ${history.entryLogs.map(
+            (l) => html`<tr><td>${fmtExact(l.enteredAt)}</td><td>${eventName(l.eventSlug)}</td><td>${l.kind === EntryKind.CHECK_IN ? 'IN' : 'OUT'}</td>
+              <td>${l.status === 'ENTERED' ? badge('ok', 'ok') : badge(`refused: ${l.notes ?? ''}`, 'bad')}</td><td>${l.gate}</td><td>${who(l.volunteer)}</td></tr>`,
+          )}</tbody></table></div>
+        </section>`
+      : null
+  }
+  <section class="card">
+    <h2>History</h2>
+    <ol class="timeline">
+      ${history.activity.map(
+        (a) => html`<li><span class="when">${fmtDate(a.createdAt)}</span><span>${p.registrations.length > 1 ? `${eventName(a.registration.eventSlug)}: ` : ''}${activityText(a)}</span><span class="muted small">${who(a.actor)}</span></li>`,
+      )}
+    </ol>
+  </section>`;
+}
+
 export function collegesPage(args: {
   colleges: CollegeRow[];
   event?: string;

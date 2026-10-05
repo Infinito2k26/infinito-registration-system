@@ -13,6 +13,15 @@ import { ActivityEntry, recordActivity } from './activity';
 /** Shown to the coordinator as-is. Nothing was changed. */
 export class ParticipantActionError extends Error {}
 
+/** One email address = one participant (case-insensitive). */
+export const DUPLICATE_EMAIL_MESSAGE = 'This email address is already registered to another participant.';
+
+/** Another participant, whatever the letter case, already has this (normalized) email. */
+export const emailOwnedByOther = (email: string, personId?: string): Prisma.PersonWhereInput => ({
+  email: { equals: email, mode: Prisma.QueryMode.insensitive },
+  ...(personId ? { id: { not: personId } } : {}),
+});
+
 const emailSchema = z.email();
 
 export const registrationReceivedKey = (eventSlug: string, personId: string) => `registration-received:${eventSlug}:${personId}`;
@@ -175,16 +184,15 @@ export class ParticipantsService {
       });
       if (!person) throw new ParticipantActionError('Participant not found');
       const from = person.email;
-      if (from === to) throw new ParticipantActionError('That is already the participant’s email');
+      if (from?.toLowerCase() === to) throw new ParticipantActionError('That is already the participant’s email');
 
-      const owner = await tx.person.findUnique({ where: { email: to } });
-      if (owner) {
-        throw new ParticipantActionError(`${to} already belongs to another participant (${owner.name ?? 'unnamed'}); records are never merged`);
+      // One email = one participant: refused (nothing changed) if anyone else has it, in any case.
+      if (await tx.person.findFirst({ where: emailOwnedByOther(to, personId), select: { id: true } })) {
+        throw new ParticipantActionError(DUPLICATE_EMAIL_MESSAGE);
       }
+      // A previous email of another participant still identifies them on form resyncs.
       const alias = await tx.personEmailAlias.findUnique({ where: { email: to } });
-      if (alias && alias.personId !== personId) {
-        throw new ParticipantActionError(`${to} was previously used by another participant; choose a different address`);
-      }
+      if (alias && alias.personId !== personId) throw new ParticipantActionError(DUPLICATE_EMAIL_MESSAGE);
       if (alias) await tx.personEmailAlias.delete({ where: { email: to } }); // changing back
 
       await tx.person.update({
@@ -216,6 +224,13 @@ export class ParticipantsService {
       );
       const queued = from ? { registrationEmails: 0, qrEmails: 0 } : await this.queueEmailsForNewAddress(tx, personId, actorId);
       return { from, to, queued };
+    }).catch((error: unknown) => {
+      // A simultaneous change/registration took the address first: the unique constraint on
+      // Person.email is the final guard. The whole change was rolled back.
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ParticipantActionError(DUPLICATE_EMAIL_MESSAGE);
+      }
+      throw error;
     });
     if (result.queued.registrationEmails + result.queued.qrEmails > 0) this.worker.kick();
     return result;

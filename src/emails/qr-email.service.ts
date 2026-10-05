@@ -10,7 +10,6 @@ import {
 } from '@prisma/client';
 import { AppConfig } from '../config/app-config.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { qrPassUrl } from '../qr/qr-image';
 import { recordActivity } from '../registrations/activity';
 import { EmailTemplate } from './email-templates';
 import { EmailOutboxService } from './email-outbox.service';
@@ -185,7 +184,8 @@ export class QrEmailService {
         // Individual registrations are "teams" named after the person; don't repeat the name.
         team: teamName && teamName !== reg.person.name ? teamName : null,
         college: reg.person.college ?? null,
-        qrUrl: qrPassUrl(this.config.baseUrl, reg.person.qrToken!),
+        // The QR encodes only this token (see qrPng); no URL or personal data.
+        qrToken: reg.person.qrToken!,
       },
     };
   }

@@ -1,4 +1,4 @@
-import { qrPng } from '../qr/qr-image';
+import { qrPng, qrTokenFromPayload } from '../qr/qr-image';
 import { escapeHtml } from '../web/html';
 
 export interface RenderedEmail {
@@ -22,7 +22,9 @@ export const EmailTemplate = {
 export interface CollegePass {
   name: string;
   events: string;
-  qrUrl: string;
+  /** The pass token (the QR's only content). Rows queued before the change have qrUrl instead. */
+  qrToken?: string;
+  qrUrl?: string;
 }
 
 /** Safe attachment file name from a student's name. */
@@ -68,8 +70,7 @@ ${
       };
 
     case EmailTemplate.QrPass: {
-      const url = s(payload, 'qrUrl');
-      const png = await qrPng(url);
+      const png = await qrPng(qrTokenFromPayload(payload));
       return {
         html: layout(`<p>Hi ${e(payload, 'name')},</p>
 <p>Your registration is verified. This is your personal entry pass for <b>${e(payload, 'eventName')}</b>${teamSuffixHtml(payload)}${payload.college ? ` (${e(payload, 'college')})` : ''}.</p>
@@ -80,7 +81,6 @@ ${
 
 Your registration is verified. This is your personal entry pass for ${s(payload, 'eventName')}${teamSuffixText(payload)}${payload.college ? ` (${s(payload, 'college')})` : ''}.
 Show the attached QR image at the gate, along with your college ID.
-Pass link: ${url}
 
 The pass is personal: one scan lets one person in.`,
         attachments: [
@@ -105,13 +105,12 @@ Please submit the registration form again with the correct details, or reply to 
 
     case EmailTemplate.CollegePasses: {
       const passes = (payload.passes ?? []) as CollegePass[];
-      const pngs = await Promise.all(passes.map((p) => qrPng(p.qrUrl)));
+      const pngs = await Promise.all(passes.map((p) => qrPng(qrTokenFromPayload(p))));
       const part = Number(payload.parts) > 1 ? ` (part ${s(payload, 'part')} of ${s(payload, 'parts')})` : '';
       const rows = passes
         .map(
           (p, i) => `<tr><td style="padding:12px 0;border-top:1px solid #e4e7eb;vertical-align:top">
-<b>${escapeHtml(p.name)}</b><br><span style="color:#52606d">${escapeHtml(s(payload, 'college'))}</span><br>${escapeHtml(p.events)}<br>
-<a href="${escapeHtml(p.qrUrl)}" style="font-size:13px">Pass link</a></td>
+<b>${escapeHtml(p.name)}</b><br><span style="color:#52606d">${escapeHtml(s(payload, 'college'))}</span><br>${escapeHtml(p.events)}</td>
 <td style="padding:12px 0 12px 12px;border-top:1px solid #e4e7eb;text-align:right"><img src="cid:pass-${i}" width="140" height="140" alt="QR pass of ${escapeHtml(p.name)}"></td></tr>`,
         )
         .join('');
@@ -125,7 +124,7 @@ Please submit the registration form again with the correct details, or reply to 
 Entry passes of ${passes.length} verified participant(s) from ${s(payload, 'college')}${part}.
 Each QR belongs to the student named with it and admits only that student. The QR images are attached.
 
-${passes.map((p) => `- ${p.name} (${p.events}): ${p.qrUrl}`).join('\n')}`,
+${passes.map((p) => `- ${p.name} (${p.events})`).join('\n')}`,
         attachments: passes.map((p, i) => ({
           filename: fileName(p.name, i),
           content: pngs[i],

@@ -210,7 +210,7 @@ describe('Sports events, dashboard views and manual gate (e2e)', () => {
       expect(activity).toMatchObject({ actorId: coordinator.id, details: expect.objectContaining({ method: 'manual', at: expect.any(String) }) });
     });
 
-    it('volunteers can do manual IN/OUT from the gate search (no private data shown)', async () => {
+    it('volunteers can do manual IN/OUT from the gate search (list: gate columns only; card: full details)', async () => {
       await submitRow(ctx, 'r1', row('Priya', 'Football')).expect(200);
       const r = await verified('Priya');
       const found = (await getAs(ctx, volunteer, '/scan/find?q=pri').expect(200)).text;
@@ -220,7 +220,7 @@ describe('Sports events, dashboard views and manual gate (e2e)', () => {
       const card = (await getAs(ctx, volunteer, `/gate/${r.id}`).expect(200)).text;
       expect(card).toContain('Manual gate (no QR scanned)');
       expect(card).toContain('MARK ENTERED (CHECK IN)');
-      expect(card).not.toContain('priya@example.com');
+      expect(card).toContain('priya@example.com'); // volunteers see the full participant details
 
       expect(flash(await postAs(ctx, volunteer, '/gate/enter', { registrationId: r.id }))).toMatch(/^✅ ENTERED \(CHECK IN\)/);
       expect((await reg('Priya')).insideSince).not.toBeNull();

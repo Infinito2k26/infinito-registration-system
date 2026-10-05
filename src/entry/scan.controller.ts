@@ -22,7 +22,9 @@ import { AppConfig } from '../config/app-config.service';
 import { DriveService } from '../drive/drive.service';
 import { QrEmailError, QrEmailService } from '../emails/qr-email.service';
 import { PaymentActionError, PaymentsService } from '../payments/payments.service';
-import { maskAadhaar } from '../registrations/aadhaar-crypto';
+import { extractQrToken } from '../qr/qr-token';
+import { volunteerDetails } from '../admin/admin.views';
+import { decryptAadhaar, formatAadhaar, maskAadhaar } from '../registrations/aadhaar-crypto';
 import { ParticipantActionError, ParticipantsService, changeEmailMessage } from '../registrations/participants.service';
 import { setFlash, takeFlash } from '../web/cookies';
 import { SafeHtml, html } from '../web/html';
@@ -31,13 +33,6 @@ import { WebExceptionFilter } from '../web/web-exception.filter';
 import { checkInFlash, checkOutFlash } from './entry-messages';
 import { EntryService, GATE_PAGE_SIZE } from './entry.service';
 
-/** Pulls the token out of a scanned/pasted pass URL, or accepts a bare token. */
-export function extractQrToken(code: string): string | null {
-  const trimmed = code.trim();
-  const fromUrl = trimmed.match(/\/p\/([\w-]{16,200})(?:[/?#]|$)/);
-  if (fromUrl) return fromUrl[1];
-  return /^[\w-]{16,200}$/.test(trimmed) ? trimmed : null;
-}
 
 /** "2/4 of team entered" for multi-member teams; the team counts as entered once all members are in. */
 function teamProgress(team: { registrations: { enteredAt: Date | null }[] } | null) {
@@ -48,12 +43,6 @@ function teamProgress(team: { registrations: { enteredAt: Date | null }[] } | nu
 }
 
 type GatePerson = NonNullable<Awaited<ReturnType<EntryService['lookup']>>>;
-
-/** "p•••@example.com": enough for a volunteer to confirm, without revealing the address. */
-function maskEmail(email: string) {
-  const [local, domain] = email.split('@');
-  return `${local.slice(0, 1)}•••@${domain ?? ''}`;
-}
 
 /**
  * The gate: QR pass pages (/p/<token>) and the manual gate (/gate/<registrationId>, no QR).
@@ -96,7 +85,7 @@ export class ScanController {
             <p id="scan-status" class="muted">Starting camera…</p>
           </div>
           <button id="start" class="primary big" hidden>Start camera</button>
-          <p class="muted small">You can also scan with the phone's normal camera app; the pass opens here if you're signed in in this browser.</p>
+          <p class="muted small">Scan passes with this scanner (a pass QR holds only a code, not a link). Older passes with a link also work here.</p>
           <form method="get" action="/scan/go" class="row-form">
             <label>Or paste the pass link / code <input name="code" required autocomplete="off"></label>
             <button>Open</button>
@@ -216,7 +205,7 @@ export class ScanController {
         }),
       );
     }
-    this.sendGateCard(req, res, person, (path) => `/p/${token}/${path}`, null);
+    await this.sendGateCard(req, res, person, (path) => `/p/${token}/${path}`, null);
   }
 
   /** Manual gate (no QR): the same card, reached from /scan/find or the participant page. */
@@ -226,7 +215,7 @@ export class ScanController {
     res.set('Cache-Control', 'no-store');
     const person = await this.entry.lookupByRegistration(registrationId);
     if (!person) throw new NotFoundException('Participant not found');
-    this.sendGateCard(req, res, person, (path) => `/gate/${path}`, registrationId);
+    await this.sendGateCard(req, res, person, (path) => `/gate/${path}`, registrationId);
   }
 
   @Post('p/:token/enter')
@@ -275,8 +264,7 @@ export class ScanController {
   async sendQr(@Param('registrationId', ParseUUIDPipe) registrationId: string, @Req() req: StaffRequest, @Res() res: Response) {
     try {
       const { toEmail } = await this.qrEmails.resend(registrationId, req.staff!.id);
-      const shown = req.staff!.role === StaffRole.VOLUNTEER ? maskEmail(toEmail) : toEmail;
-      setFlash(res, { type: 'ok', text: `QR email queued to ${shown}` }, this.config.secureCookies);
+      setFlash(res, { type: 'ok', text: `QR email queued to ${toEmail}` }, this.config.secureCookies);
     } catch (error) {
       if (!(error instanceof QrEmailError)) throw error;
       setFlash(res, { type: 'error', text: error.message }, this.config.secureCookies);
@@ -302,8 +290,7 @@ export class ScanController {
     if (!personId) throw new NotFoundException('Participant not found');
     try {
       const result = await this.participants.changeEmail(personId, typeof body.email === 'string' ? body.email.slice(0, 320) : '', req.staff!.id);
-      const old = req.staff!.role === StaffRole.VOLUNTEER && result.from ? maskEmail(result.from) : result.from;
-      setFlash(res, { type: 'ok', text: changeEmailMessage(result, old) }, this.config.secureCookies);
+      setFlash(res, { type: 'ok', text: changeEmailMessage(result) }, this.config.secureCookies);
     } catch (error) {
       if (!(error instanceof ParticipantActionError)) throw error;
       setFlash(res, { type: 'error', text: error.message }, this.config.secureCookies);
@@ -348,8 +335,9 @@ export class ScanController {
   /**
    * The gate card: photo, name, college and, per event, the one action the current state allows.
    * Checks shown in the server's order: verified -> not blocked -> IN/OUT state.
+   * For a VOLUNTEER it is also their participant view, with the full details (incl. Aadhaar).
    */
-  private sendGateCard(
+  private async sendGateCard(
     req: StaffRequest,
     res: Response,
     person: GatePerson,
@@ -360,8 +348,14 @@ export class ScanController {
     const csrf = this.auth.csrfToken(staff.sessionId);
     const manage = staff.role !== StaffRole.VOLUNTEER;
     const canVerify = this.canVerify(req);
-    // Role-filtered: the gate card never carries the encrypted Aadhaar or an Aadhaar link.
+    const volunteer = staff.role === StaffRole.VOLUNTEER;
+    // Volunteers see the full Aadhaar here: decrypted on the server for this signed-in request
+    // only. The encrypted value itself is never rendered, for any role.
+    const aadhaarFull = volunteer ? decryptAadhaar(person.aadhaarEncrypted, this.config.aadhaarKey) : null;
     person.aadhaarEncrypted = null;
+    const details = volunteer
+      ? volunteerDetails({ person, aadhaarFull, history: await this.entry.historyFor(person.id), eventName: this.eventName, driveEnabled: this.drive.enabled })
+      : null;
     const photo =
       this.drive.enabled && person.photoDriveId
         ? html`<img class="photo" src="/staff/files/${person.id}/photo" alt="Photo of ${person.name}">`
@@ -422,12 +416,13 @@ export class ScanController {
             <div>
               <h1>${person.name}</h1>
               <p>${person.college || html`<span class="muted">College not given</span>`}</p>
-              ${person.aadhaarLast4 ? html`<p class="small mono">Aadhaar ${maskAadhaar(person.aadhaarLast4)}</p>` : null}
-              <p class="small">${person.email ? html`Email ${manage ? person.email : maskEmail(person.email)}` : html`<span class="muted">No email</span>`}</p>
+              ${aadhaarFull ? html`<p class="small mono">Aadhaar ${formatAadhaar(aadhaarFull)}</p>` : person.aadhaarLast4 ? html`<p class="small mono">Aadhaar ${maskAadhaar(person.aadhaarLast4)}</p>` : null}
+              <p class="small">${person.email ? html`Email ${person.email}` : html`<span class="muted">No email</span>`}</p>
               <p class="small">${idDoc}</p>
             </div>
           </section>
           ${rows.length ? rows : html`<p class="muted">No registrations for this pass.</p>`}
+          ${details}
           ${
             person.registrations[0]
               ? html`<section class="card">

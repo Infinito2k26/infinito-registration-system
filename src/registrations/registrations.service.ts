@@ -8,7 +8,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ActivityEntry, recordActivity } from './activity';
 import { encryptAadhaar } from './aadhaar-crypto';
 import { collegeDisplayName, collegeNameKey } from './college';
-import { ParticipantsService, registrationReceivedKey } from './participants.service';
+import { ParticipantsService, emailOwnedByOther, registrationReceivedKey } from './participants.service';
 
 export interface IngestSource {
   eventSlug: string;
@@ -167,7 +167,8 @@ export class RegistrationsService {
     const sourceKey = `${responseId}#${member.position}`;
     const existing =
       (member.email
-        ? ((await tx.person.findUnique({ where: { email: member.email } })) ??
+        ? // Case-insensitive, so an email can never be split across two participants by letter case.
+          ((await tx.person.findFirst({ where: emailOwnedByOther(member.email) })) ??
           (await tx.personEmailAlias.findUnique({ where: { email: member.email }, include: { person: true } }))?.person)
         : undefined) ?? (await tx.person.findUnique({ where: { sourceKey } }));
     if (!existing) {

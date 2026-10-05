@@ -2,7 +2,6 @@ import { Injectable } from '@nestjs/common';
 import { ActivityType, EmailBatchKind, EmailStatus, PaymentStatus, Prisma } from '@prisma/client';
 import { AppConfig } from '../config/app-config.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { qrPassUrl } from '../qr/qr-image';
 import { ActivityEntry, recordActivity } from '../registrations/activity';
 import { CollegePass, EmailTemplate } from './email-templates';
 import { EmailOutboxService } from './email-outbox.service';
@@ -178,7 +177,7 @@ export class CollegeEmailService {
             pass: {
               name: reg.person.name ?? reg.person.email ?? '',
               events: '',
-              qrUrl: qrPassUrl(this.config.baseUrl, reg.person.qrToken!),
+              qrToken: reg.person.qrToken!,
             },
             regIds: [],
           };

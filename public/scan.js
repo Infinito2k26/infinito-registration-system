@@ -23,9 +23,12 @@
     }
   });
 
+  // A pass QR holds only the raw token; older passes hold ".../p/<token>". Anything else is ignored.
   function tokenFrom(text) {
-    var m = String(text).match(/\/p\/([\w-]{16,200})(?:[/?#]|$)/);
-    return m ? m[1] : null;
+    var value = String(text).trim();
+    var m = value.match(/\/p\/([\w-]{16,200})(?:[/?#]|$)/);
+    if (m) return m[1];
+    return /^[\w-]{16,200}$/.test(value) ? value : null;
   }
 
   function stop() {

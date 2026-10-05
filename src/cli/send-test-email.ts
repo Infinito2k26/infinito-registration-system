@@ -10,7 +10,6 @@ import { randomUUID } from 'crypto';
 import { AppConfig } from '../config/app-config.service';
 import { EmailTemplate, renderEmail } from '../emails/email-templates';
 import { ResendTransport } from '../emails/mail-transport';
-import { qrPassUrl } from '../qr/qr-image';
 
 async function main() {
   const to = process.argv[2];
@@ -26,7 +25,7 @@ async function main() {
     name: 'Test Participant',
     eventName: 'Sample Event',
     team: 'Sample Team',
-    qrUrl: qrPassUrl(config.baseUrl, 'sample-token-not-a-real-pass'),
+    qrToken: 'sample-token-not-a-real-pass',
   });
   const id = await new ResendTransport(resendApiKey, from, replyTo).send({
     ...rendered,

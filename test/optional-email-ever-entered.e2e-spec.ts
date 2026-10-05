@@ -121,7 +121,7 @@ describe('Optional email and Ever entered (e2e)', () => {
       ]);
       const qr = mails.find((m) => m.template === EmailTemplate.QrPass)!;
       expect(qr.idempotencyKey).toBe(`qr-pass:${after.id}:initial`);
-      expect((qr.payload as { qrUrl: string }).qrUrl).toContain(before.person.qrToken!);
+      expect((qr.payload as { qrToken: string }).qrToken).toBe(before.person.qrToken);
       expect((mails.find((m) => m.template === EmailTemplate.RegistrationReceived)!.payload as { verified: boolean }).verified).toBe(true);
       const activity = await ctx.prisma.registrationActivity.findMany({ where: { registrationId: after.id }, orderBy: { createdAt: 'asc' } });
       expect(activity.map((a) => a.type)).toEqual(
@@ -250,7 +250,7 @@ describe('Optional email and Ever entered (e2e)', () => {
       expect(l.outside).toEqual(['Asha', 'Bina']);
       expect(l.inside).toEqual([]);
       // Expected arrival "today" (Arrivals) is a different concept and stays as it was.
-      const arrivals = (await getAs(ctx, coordinator, '/admin/arrivals?arrival=2026-10-04').expect(200)).text;
+      const arrivals = (await getAs(ctx, coordinator, '/admin/arrivals?date=2026-10-04').expect(200)).text;
       expect(arrivals).toContain('Asha');
     });
 
