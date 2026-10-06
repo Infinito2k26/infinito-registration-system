@@ -1,6 +1,9 @@
 import { createServer, IncomingMessage, Server } from 'http';
 import { AddressInfo } from 'net';
+import { ConfigService } from '@nestjs/config';
 import { Transporter, createTransport } from 'nodemailer';
+import { AppConfig } from '../config/app-config.service';
+import { EmailTemplate, renderEmail } from './email-templates';
 import { OutgoingEmail, PermanentSendError, ResendTransport, SendPausedError, SmtpTransport, classifySmtpError } from './mail-transport';
 
 /** Minimal stand-in for api.resend.com, driven through the real SDK via RESEND_BASE_URL. */
@@ -165,5 +168,57 @@ describe('SmtpTransport', () => {
   it('never puts the password in an error message', () => {
     const error = classifySmtpError(Object.assign(new Error('Invalid login'), { code: 'EAUTH', responseCode: 535 }));
     expect(error.message).not.toContain('app-password');
+  });
+});
+
+/**
+ * GoDaddy Professional Email (smtpout.secureserver.net:465, SSL): with only the .env settings,
+ * every application email (all templates) is sent From "Infinito 2K26 <info@infinito2k26.com>".
+ */
+describe('GoDaddy sender configuration', () => {
+  const env = {
+    EMAIL_PROVIDER: 'smtp',
+    SMTP_HOST: 'smtpout.secureserver.net',
+    SMTP_PORT: '465',
+    SMTP_USER: 'info@infinito2k26.com',
+    SMTP_PASS: 'not-a-real-password',
+    MAIL_FROM: 'Infinito 2K26 <info@infinito2k26.com>',
+    MAIL_REPLY_TO: 'info@infinito2k26.com',
+  };
+  const payloads: Record<string, Record<string, unknown>> = {
+    [EmailTemplate.RegistrationReceived]: { name: 'Asha', eventName: 'Table Tennis', team: null, isCaptain: true, transactionId: null },
+    [EmailTemplate.QrPass]: { name: 'Asha', eventName: 'Table Tennis', team: null, college: 'NIT Patna', qrToken: 'tokenAAAAAAAAAAAAAAAA' },
+    [EmailTemplate.PaymentRejected]: { name: 'Asha', eventName: 'Table Tennis', team: null, transactionId: null, remarks: 'ID unreadable' },
+    [EmailTemplate.StaffLogin]: { name: 'Coordinator', ttlMinutes: 15, url: 'https://example.test/auth/magic?token=x' },
+    [EmailTemplate.CollegePasses]: { recipientName: 'Asha', college: 'NIT Patna', eventName: null, part: 1, parts: 1, passes: [{ name: 'Asha', events: 'Table Tennis', qrToken: 'tokenAAAAAAAAAAAAAAAA' }] },
+  };
+
+  it('uses smtpout.secureserver.net:465 over SSL with the mailbox login', () => {
+    const { provider, smtp, from, replyTo } = new AppConfig(new ConfigService(env)).email;
+    expect(provider).toBe('smtp');
+    expect(smtp).toEqual({ host: 'smtpout.secureserver.net', port: 465, secure: true, user: 'info@infinito2k26.com', pass: 'not-a-real-password' });
+    expect(from).toBe('Infinito 2K26 <info@infinito2k26.com>');
+    expect(replyTo).toBe('info@infinito2k26.com');
+    // Without MAIL_FROM the sender is the same mailbox, with the same display name.
+    expect(new AppConfig(new ConfigService({ ...env, MAIL_FROM: '' })).email.from).toBe('Infinito 2K26 <info@infinito2k26.com>');
+  });
+
+  it.each(Object.values(EmailTemplate))('sends the %s email From Infinito 2K26 <info@infinito2k26.com>', async (template) => {
+    expect(payloads[template]).toBeDefined(); // a new template must be added to this test
+    const { smtp, from, replyTo } = new AppConfig(new ConfigService(env)).email;
+    const stream = createTransport({ streamTransport: true, buffer: true });
+    let mime = '';
+    const transport = new SmtpTransport(smtp, from, replyTo, {
+      sendMail: async (mail: object) => {
+        const info = (await stream.sendMail(mail)) as { message: Buffer };
+        mime = info.message.toString();
+        return info;
+      },
+    } as unknown as Transporter);
+    const rendered = await renderEmail(template, payloads[template]);
+    await transport.send({ ...rendered, to: 'participant@example.com', subject: `Test ${template}`, idempotencyKey: `test:${template}` });
+    expect(mime).toContain('From: Infinito 2K26 <info@infinito2k26.com>');
+    expect(mime).toContain('Reply-To: info@infinito2k26.com');
+    expect(mime).not.toMatch(/gmail\.com|resend/i);
   });
 });

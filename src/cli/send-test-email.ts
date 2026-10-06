@@ -39,6 +39,8 @@ async function main() {
     idempotencyKey: `cli-test:${randomUUID()}`,
     tags: { template: 'cli-test' },
   });
+  // The SMTP connection pool would otherwise keep this one-off script running.
+  if (transport instanceof SmtpTransport) transport.close();
   console.log(`Sent via ${transport.name}. Message id: ${id}\nFrom: ${from}${replyTo ? `\nReply-To: ${replyTo}` : ''}\nTo: ${to}`);
 }
 
