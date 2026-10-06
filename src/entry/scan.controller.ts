@@ -276,7 +276,7 @@ export class ScanController {
    * Change email from the gate card (any staff role, incl. volunteers). Same service, checks and
    * audit as the dashboard: same person, QR token, verification and gate history; old address
    * kept as an alias; queued emails redirected. Changing an email sends nothing; adding the
-   * first email queues the registration email (and the QR email if verified).
+   * first email queues the QR email if the participant is verified.
    */
   @Post('gate/:registrationId/change-email')
   @UseGuards(StaffGuard)
@@ -438,7 +438,7 @@ export class ScanController {
                     <label>Change email <input type="email" name="email" required placeholder="new@example.com"></label>
                     <button>Change email</button>
                   </form>
-                  <p class="muted small">${person.email ? 'Keeps the same participant, QR pass and history. Nothing is emailed automatically; use Send QR email afterwards.' : 'No email yet. Adding one keeps the same participant, QR pass and history, and emails the registration confirmation (plus the QR pass if verified).'}</p>
+                  <p class="muted small">${person.email ? 'Keeps the same participant, QR pass and history. Nothing is emailed automatically; use Send QR email afterwards.' : 'No email yet. Adding one keeps the same participant, QR pass and history, and emails the QR pass if the registration is verified.'}</p>
                 </section>`
               : null
           }

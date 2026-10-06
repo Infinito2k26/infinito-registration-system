@@ -365,7 +365,7 @@ export class RegistrationsService {
         tx,
         regs.map((r) => ({ registrationId: r.id, type: ActivityType.EMAIL_CHANGED, details: { from: null, to, source: 'form' } })),
       );
-      const queued = await this.participants.queueEmailsForNewAddress(tx, personId, undefined, { registrationEmail: false });
+      const queued = await this.participants.queueEmailsForNewAddress(tx, personId);
       queuedEmails += queued.qrEmails;
     }
 

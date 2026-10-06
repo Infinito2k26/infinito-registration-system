@@ -519,7 +519,7 @@ export function participantPage(args: {
       <label>Change email <input type="email" name="email" required placeholder="new@example.com"></label>
       <button>Change email</button>
     </form>
-    <p class="muted small">${p.email ? 'Keeps the same participant, QR pass and history. Nothing is emailed automatically; use Send QR email afterwards.' : 'No email yet. Adding one keeps the same participant, QR pass and history, and emails the registration confirmation (plus the QR pass if verified).'}</p>
+    <p class="muted small">${p.email ? 'Keeps the same participant, QR pass and history. Nothing is emailed automatically; use Send QR email afterwards.' : 'No email yet. Adding one keeps the same participant, QR pass and history, and emails the QR pass if the registration is verified.'}</p>
   </section>
 
   <section class="card">

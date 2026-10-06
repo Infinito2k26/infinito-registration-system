@@ -11,6 +11,7 @@ type Payload = Record<string, unknown>;
 
 /** Template names stored in EmailOutbox.template. */
 export const EmailTemplate = {
+  /** No longer sent (nothing queues it); kept so older emails in the history still render. */
   RegistrationReceived: 'registration-received',
   QrPass: 'qr-pass',
   PaymentRejected: 'payment-rejected',
