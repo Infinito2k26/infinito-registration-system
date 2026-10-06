@@ -32,7 +32,12 @@ export class AppConfig {
     if (!this.str('APP_BASE_URL').startsWith('https://')) {
       problems.push('APP_BASE_URL must be the public https:// URL');
     }
-    if (!this.str('RESEND_API_KEY')) problems.push('RESEND_API_KEY must be set');
+    const { provider, smtp } = this.email;
+    if (provider === 'resend' && !this.str('RESEND_API_KEY')) problems.push('RESEND_API_KEY must be set');
+    if (provider === 'smtp' && !(smtp.host && smtp.user && smtp.pass)) {
+      problems.push('EMAIL_PROVIDER=smtp needs SMTP_HOST, SMTP_USER and SMTP_PASS');
+    }
+    if (provider !== 'resend' && provider !== 'smtp') problems.push('EMAIL_PROVIDER must be "resend" or "smtp"');
     return problems;
   }
 
@@ -77,11 +82,28 @@ export class AppConfig {
   }
 
   get email() {
+    const provider = (this.str('EMAIL_PROVIDER') || 'resend').toLowerCase();
+    const smtpPort = this.num('SMTP_PORT', 465);
+    const smtp = {
+      host: this.str('SMTP_HOST'),
+      port: smtpPort,
+      /** TLS from the start on 465; STARTTLS on other ports (587). SMTP_SECURE overrides. */
+      secure: this.str('SMTP_SECURE') ? this.str('SMTP_SECURE') === 'true' : smtpPort === 465,
+      user: this.str('SMTP_USER'),
+      // Gmail shows app passwords in groups of four ("abcd efgh ..."); the spaces are not part of it.
+      pass: this.str('SMTP_PASS').replace(/\s+/g, ''),
+    };
     return {
+      /** "resend" (default) or "smtp" (e.g. Gmail / Google Workspace with an app password). */
+      provider,
+      smtp,
       resendApiKey: this.str('RESEND_API_KEY'),
       webhookSecret: this.str('RESEND_WEBHOOK_SECRET'),
-      /** "Name <address>" on a domain verified in the Resend account. No default on purpose. */
-      from: this.str('MAIL_FROM'),
+      /**
+       * "Name <address>". Resend: on a verified domain, no default on purpose. SMTP: defaults to
+       * the SMTP account itself (Gmail sends only as the signed-in address or its aliases).
+       */
+      from: this.str('MAIL_FROM') || (provider === 'smtp' && smtp.user ? `Infinito 2K26 <${smtp.user}>` : ''),
       replyTo: this.str('MAIL_REPLY_TO') || undefined,
       /**
        * Development only: deliver every email to this address instead of the real recipient
@@ -98,12 +120,19 @@ export class AppConfig {
     };
   }
 
+  /** Whether the chosen provider has its credentials; otherwise development prints emails to the log. */
+  emailProviderConfigured(): boolean {
+    const { provider, resendApiKey, smtp } = this.email;
+    return provider === 'smtp' ? Boolean(smtp.host && smtp.user && smtp.pass) : Boolean(resendApiKey);
+  }
+
   /** Human-readable problems with the email settings; empty when sending can start. */
   emailConfigProblems(): string[] {
-    const { resendApiKey, from, replyTo } = this.email;
+    const { provider, resendApiKey, from, replyTo } = this.email;
     const problems: string[] = [];
-    if (!resendApiKey) return problems;
-    if (!resendApiKey.startsWith('re_')) problems.push('RESEND_API_KEY should start with "re_"');
+    if (provider !== 'resend' && provider !== 'smtp') return ['EMAIL_PROVIDER must be "resend" or "smtp"'];
+    if (!this.emailProviderConfigured()) return problems;
+    if (provider === 'resend' && !resendApiKey.startsWith('re_')) problems.push('RESEND_API_KEY should start with "re_"');
     const address = from.match(/<([^<>\s]+@[^<>\s]+)>\s*$/)?.[1] ?? (/^[^<>\s]+@[^<>\s]+$/.test(from) ? from : '');
     if (!address) problems.push('MAIL_FROM must be "Name <address@your-verified-domain>"');
     if (replyTo && !/^[^<>\s]+@[^<>\s]+$/.test(replyTo)) problems.push('MAIL_REPLY_TO must be a plain email address');

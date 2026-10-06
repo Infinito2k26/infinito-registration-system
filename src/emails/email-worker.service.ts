@@ -10,6 +10,7 @@ import {
   PermanentSendError,
   ResendTransport,
   SendPausedError,
+  SmtpTransport,
 } from './mail-transport';
 
 const STUCK_AFTER_MS = 5 * 60 * 1000;
@@ -46,13 +47,14 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
   }
 
   private createTransport(): MailTransport | null {
-    const { resendApiKey, from, replyTo, testRecipient } = this.config.email;
-    if (!resendApiKey) {
+    const { provider, smtp, resendApiKey, from, replyTo, testRecipient } = this.config.email;
+    const credentials = provider === 'smtp' ? 'SMTP_HOST / SMTP_USER / SMTP_PASS are' : 'RESEND_API_KEY is';
+    if (!this.config.emailProviderConfigured() && (provider === 'resend' || provider === 'smtp')) {
       if (this.config.isProduction) {
-        this.logger.error('RESEND_API_KEY is not set; emails stay queued and are not sent');
+        this.logger.error(`${credentials} not set; emails stay queued and are not sent`);
         return null;
       }
-      this.logger.warn('RESEND_API_KEY is not set; emails are printed to the log instead of sent');
+      this.logger.warn(`${credentials} not set; emails are printed to the log instead of sent`);
       return new ConsoleTransport();
     }
     if (this.config.isProduction && process.env.EMAIL_TEST_RECIPIENT) {
@@ -64,10 +66,10 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
       return null;
     }
     this.logger.log(
-      `Sending via Resend as ${from}${replyTo ? `, reply-to ${replyTo}` : ''}` +
+      `Sending via ${provider === 'smtp' ? `SMTP ${smtp.host}:${smtp.port}` : 'Resend'} as ${from}${replyTo ? `, reply-to ${replyTo}` : ''}` +
         (testRecipient ? `. TEST MODE: every email is delivered to ${testRecipient}` : ''),
     );
-    return new ResendTransport(resendApiKey, from, replyTo);
+    return provider === 'smtp' ? new SmtpTransport(smtp, from, replyTo) : new ResendTransport(resendApiKey, from, replyTo);
   }
 
   get transportName() {
@@ -76,6 +78,11 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
 
   onApplicationBootstrap() {
     if (!this.config.email.workerEnabled || !this.transport) return;
+    // SMTP: check the login now (a wrong app password shows up here, not at the first email).
+    this.transport.verify?.().then(
+      () => this.logger.log(`Email provider login OK (${this.transport!.name})`),
+      (error: unknown) => this.logger.error(`Email provider login failed (${this.transport!.name}): ${error instanceof Error ? error.message : String(error)}`),
+    );
     this.schedule(1_000);
   }
 
