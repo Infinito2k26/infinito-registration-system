@@ -155,6 +155,11 @@ export class SmtpTransport implements MailTransport {
     await this.transporter.verify();
   }
 
+  /** Closes the pooled connection (one-off scripts; the worker keeps it open). */
+  close(): void {
+    this.transporter.close();
+  }
+
   async send(email: OutgoingEmail): Promise<string | null> {
     try {
       const info = (await this.transporter.sendMail({

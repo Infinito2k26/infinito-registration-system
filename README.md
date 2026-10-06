@@ -586,7 +586,14 @@ A background worker sends them through the provider chosen by `EMAIL_PROVIDER`:
 
 - **Resend** (default): `RESEND_API_KEY`, `MAIL_FROM` on a verified domain, `MAIL_REPLY_TO`, and
   optionally `RESEND_WEBHOOK_SECRET` for delivery tracking. Free plan: 100 emails/day.
-- **SMTP** (`EMAIL_PROVIDER=smtp`), e.g. Gmail / Google Workspace: `SMTP_HOST=smtp.gmail.com`,
+- **SMTP** (`EMAIL_PROVIDER=smtp`). Production uses **GoDaddy Professional Email** for
+  `info@infinito2k26.com`: `SMTP_HOST=smtpout.secureserver.net`, `SMTP_PORT=465` (SSL),
+  `SMTP_USER=info@infinito2k26.com`, `SMTP_PASS` = that mailbox's password,
+  `MAIL_FROM="Infinito 2K26 <info@infinito2k26.com>"`, `MAIL_REPLY_TO=info@infinito2k26.com`.
+  GoDaddy allows 500 emails/day per mailbox over SMTP: `EMAIL_DAILY_CAP=450`,
+  `EMAIL_SEND_INTERVAL_MS=2000`. The domain's SPF (`include:secureserver.net`), GoDaddy DKIM
+  (`secureserver1/2._domainkey`) and DMARC records cover this sender.
+  Alternatively Gmail / Google Workspace: `SMTP_HOST=smtp.gmail.com`,
   `SMTP_PORT=465`, `SMTP_USER` = the Gmail address, `SMTP_PASS` = a Google app password (needs
   2-Step Verification; spaces are ignored). `MAIL_FROM` defaults to that address. Gmail allows about
   500 emails/day (free) or 2,000/day (paid Workspace): set `EMAIL_DAILY_CAP` a little below that and
