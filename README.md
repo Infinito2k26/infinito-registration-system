@@ -86,6 +86,7 @@ Every variable is documented in [.env.example](.env.example). The main ones:
 | `APP_SECRET` | Signs CSRF tokens (≥ 32 characters in production) |
 | `FORMS_WEBHOOK_SECRET` | Shared with the Apps Script (≥ 24 random characters in production) |
 | `BOOTSTRAP_ADMIN_EMAILS` | Comma-separated; made active admins on every start |
+| `EMAIL_PROVIDER`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` | Email provider: Resend (default) or SMTP, e.g. Gmail (§34) |
 | `RESEND_API_KEY`, `MAIL_FROM`, `MAIL_REPLY_TO`, `RESEND_WEBHOOK_SECRET` | Email (§34) |
 | `EMAIL_TEST_RECIPIENT` | Development only: deliver every email to one inbox |
 | `EMAIL_WORKER_ENABLED` | Set `false` on all but one instance per database |
@@ -572,7 +573,7 @@ horizontal page overflow.
 - **Inputs** use 16px text, so iOS doesn't zoom in.
 - **Nothing depends on hover.**
 
-## 34. Resend / email worker
+## 34. Email worker (Resend or SMTP)
 
 All emails go through `EmailOutbox`:
 - registration received
@@ -581,23 +582,30 @@ All emails go through `EmailOutbox`:
 - college bulk emails
 - sign-in links
 
-A background worker sends them through Resend. Configure it in `.env`:
-- `RESEND_API_KEY`
-- `MAIL_FROM` on a verified domain
-- `MAIL_REPLY_TO`
-- `RESEND_WEBHOOK_SECRET`, optional, for delivery tracking
+A background worker sends them through the provider chosen by `EMAIL_PROVIDER`:
 
-To check the setup, run `npm run email:test -- you@example.com`.
+- **Resend** (default): `RESEND_API_KEY`, `MAIL_FROM` on a verified domain, `MAIL_REPLY_TO`, and
+  optionally `RESEND_WEBHOOK_SECRET` for delivery tracking. Free plan: 100 emails/day.
+- **SMTP** (`EMAIL_PROVIDER=smtp`), e.g. Gmail / Google Workspace: `SMTP_HOST=smtp.gmail.com`,
+  `SMTP_PORT=465`, `SMTP_USER` = the Gmail address, `SMTP_PASS` = a Google app password (needs
+  2-Step Verification; spaces are ignored). `MAIL_FROM` defaults to that address. Gmail allows about
+  500 emails/day (free) or 2,000/day (paid Workspace): set `EMAIL_DAILY_CAP` a little below that and
+  `EMAIL_SEND_INTERVAL_MS=2000`. The login is checked at start-up ("Email provider login OK/failed"
+  in the log). There is no delivery webhook and no provider-side idempotency key with SMTP.
+
+Switching provider is only a change of these values (then restart). To check the setup, run
+`npm run email:test -- you@example.com`.
 
 How the worker behaves:
 - **No duplicates.** Each email has a unique idempotency key, which is also sent to Resend.
-  Retries, double clicks and crashes never duplicate an email.
+  Retries and double clicks never duplicate an email. (With SMTP, a crash in the instant between
+  handing an email over and recording it could, rarely, send that one email twice.)
 - **Concurrency.** Rows are claimed atomically, so two instances never send the same row. Still, run
   only one sender per database (`EMAIL_WORKER_ENABLED=false` elsewhere).
 - **Errors:**
   - An invalid recipient fails only that email.
-  - Rate limits, used-up quota, a bad key or an unverified sender pause the whole queue without
-    using up attempts.
+  - Rate limits, used-up quota (incl. Gmail's daily limit), a bad key / app password or an
+    unverified sender pause the whole queue without using up attempts.
   - 5xx errors retry with backoff, up to `EMAIL_MAX_ATTEMPTS`.
 - **Delivery tracking.** With the Resend webhook set to `<APP_BASE_URL>/webhooks/resend` (events
   `email.delivered`, `email.delivery_delayed`, `email.bounced`, `email.complained`, `email.failed`,
@@ -624,7 +632,8 @@ With `NODE_ENV=production` the app **refuses to start** if any of these is true:
 - `APP_SECRET` is shorter than 32 characters.
 - `FORMS_WEBHOOK_SECRET` is shorter than 24 characters, or is still the placeholder.
 - `APP_BASE_URL` is not `https://`.
-- `RESEND_API_KEY` is missing.
+- `RESEND_API_KEY` is missing (`EMAIL_PROVIDER=resend`, the default), or `SMTP_HOST`,
+  `SMTP_USER` or `SMTP_PASS` is missing (`EMAIL_PROVIDER=smtp`).
 
 Production also ignores `EMAIL_TEST_RECIPIENT`. Cookies are `Secure` over https.
 
@@ -691,8 +700,8 @@ A Cloudflare tunnel is only a local testing aid; the app doesn't depend on one.
 | `❌ Webhook secret mismatch` | Script `WEBHOOK_SECRET` ≠ server `FORMS_WEBHOOK_SECRET` |
 | `❌ Member 1: … is not a valid email` | Fix the cell, select the row, *Resync selected rows* |
 | Login says "Cross-site request blocked" | Hard-reload `/login` (an old cached page); make sure you use the same host as `APP_BASE_URL` |
-| No sign-in email in development | Without `RESEND_API_KEY` the link is in the server log |
-| Emails stay "queued" | Check the server log for "Email sending paused/disabled": key, `MAIL_FROM` or quota |
+| No sign-in email in development | Without the provider's credentials (`RESEND_API_KEY` or `SMTP_*`) the link is in the server log |
+| Emails stay "queued" | Check the server log for "Email sending paused/disabled" or "Email provider login failed": key / app password, `MAIL_FROM` or daily quota |
 | "No photo" everywhere | `GOOGLE_SERVICE_ACCOUNT_JSON` missing, or folders not shared with the service account |
 | A participant appears twice under different events | The Sports answer changed spelling; fix the form option and resync |
 | `❌ Sports is missing …` | The row has no Sports answer; fill it in the sheet and *Resync selected rows*. If Status adds "(no Sports/Sport/Event/Game column found …)", the script couldn't find the column: check the header and the execution log |

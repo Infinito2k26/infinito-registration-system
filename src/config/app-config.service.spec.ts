@@ -38,6 +38,23 @@ describe('AppConfig', () => {
     expect(config({ RESEND_API_KEY: 're_x', MAIL_FROM: 'Infinito <no-reply@infinito2k26.com>' }).emailConfigProblems()).toEqual([]);
   });
 
+  it('EMAIL_PROVIDER=smtp: needs SMTP settings in production; defaults the sender to the SMTP account', () => {
+    const smtp = { ...goodProduction, RESEND_API_KEY: '', EMAIL_PROVIDER: 'smtp' };
+    expect(() => config(smtp)).toThrow('EMAIL_PROVIDER=smtp needs SMTP_HOST, SMTP_USER and SMTP_PASS');
+    const ok = config({ ...smtp, SMTP_HOST: 'smtp.gmail.com', SMTP_USER: 'sender@gmail.com', SMTP_PASS: 'abcd efgh ijkl mnop' });
+    expect(ok.email.smtp).toEqual({ host: 'smtp.gmail.com', port: 465, secure: true, user: 'sender@gmail.com', pass: 'abcdefghijklmnop' });
+    expect(ok.email.from).toBe('Infinito 2K26 <sender@gmail.com>');
+    expect(ok.emailProviderConfigured()).toBe(true);
+    expect(ok.emailConfigProblems()).toEqual([]);
+    // Port 587 uses STARTTLS; an explicit MAIL_FROM wins.
+    const starttls = config({ EMAIL_PROVIDER: 'smtp', SMTP_HOST: 'smtp-relay.brevo.com', SMTP_PORT: '587', SMTP_USER: 'u', SMTP_PASS: 'p', MAIL_FROM: 'Infinito <passes@example.com>' });
+    expect(starttls.email.smtp.secure).toBe(false);
+    expect(starttls.email.from).toBe('Infinito <passes@example.com>');
+    expect(() => config({ ...goodProduction, EMAIL_PROVIDER: 'carrier-pigeon' })).toThrow('EMAIL_PROVIDER must be "resend" or "smtp"');
+    // Resend stays the default and keeps requiring its key.
+    expect(config({}).email.provider).toBe('resend');
+  });
+
   it('derives event display names from the slug (short words uppercased)', () => {
     const c = config({});
     expect(['tt', 'hoki', 'table-tennis', 'e-sports-bgmi'].map((slug) => c.eventName(slug))).toEqual([

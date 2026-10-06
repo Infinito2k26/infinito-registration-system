@@ -1,6 +1,7 @@
 import { createServer, IncomingMessage, Server } from 'http';
 import { AddressInfo } from 'net';
-import { OutgoingEmail, PermanentSendError, ResendTransport, SendPausedError } from './mail-transport';
+import { Transporter, createTransport } from 'nodemailer';
+import { OutgoingEmail, PermanentSendError, ResendTransport, SendPausedError, SmtpTransport, classifySmtpError } from './mail-transport';
 
 /** Minimal stand-in for api.resend.com, driven through the real SDK via RESEND_BASE_URL. */
 describe('ResendTransport', () => {
@@ -94,5 +95,75 @@ describe('ResendTransport', () => {
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(PermanentSendError);
     expect(error).not.toBeInstanceOf(SendPausedError);
+  });
+});
+
+describe('SmtpTransport', () => {
+  const email: OutgoingEmail = {
+    to: 'asha@example.com',
+    subject: 'Your pass',
+    html: '<p>hi <img src="cid:qr-pass"></p>',
+    text: 'hi',
+    idempotencyKey: 'qr-pass:reg-1:initial',
+    attachments: [{ filename: 'pass.png', content: Buffer.from('png'), contentType: 'image/png', contentId: 'qr-pass' }],
+  };
+  const options = { host: 'smtp.gmail.com', port: 465, secure: true, user: 'sender@gmail.com', pass: 'app-password' };
+
+  it('builds the message: from, to, reply-to, subject, both bodies and the inline QR image', async () => {
+    // nodemailer's stream transport builds the real MIME message without sending anything.
+    const sent: string[] = [];
+    const stream = createTransport({ streamTransport: true, buffer: true });
+    const transport = new SmtpTransport(options, 'Infinito 2K26 <sender@gmail.com>', 'help@example.com', {
+      sendMail: async (mail: object) => {
+        const info = (await stream.sendMail(mail)) as { message: Buffer; messageId: string };
+        sent.push(info.message.toString());
+        return info;
+      },
+    } as unknown as Transporter);
+    const id = await transport.send(email);
+    expect(id).toMatch(/^<.+>$/);
+    const mime = sent[0];
+    expect(mime).toContain('From: Infinito 2K26 <sender@gmail.com>');
+    expect(mime).toContain('To: asha@example.com');
+    expect(mime).toContain('Reply-To: help@example.com');
+    expect(mime).toContain('Subject: Your pass');
+    expect(mime).toContain('Content-ID: <qr-pass>');
+    expect(mime).toContain('X-Infinito-Ref: qr-pass:reg-1:initial');
+    expect(mime).toMatch(/Content-Type: text\/plain/);
+    expect(mime).toMatch(/Content-Type: text\/html/);
+  });
+
+  const failing = (error: object) =>
+    new SmtpTransport(options, 'sender@gmail.com', undefined, {
+      sendMail: () => Promise.reject(Object.assign(new Error('smtp failure'), error)),
+    } as unknown as Transporter);
+
+  it.each([
+    ['Gmail daily limit', { responseCode: 550, response: '550-5.4.5 Daily user sending limit exceeded.' }, 3_600_000],
+    ['wrong app password', { code: 'EAUTH', responseCode: 535, response: '535-5.7.8 Username and Password not accepted' }, 300_000],
+    ['temporary throttling', { responseCode: 421, response: '421-4.7.0 Try again later' }, 60_000],
+  ])('pauses the queue on %s', async (_label, error, pauseMs) => {
+    const result = await failing(error).send(email).catch((e: unknown) => e);
+    expect(result).toBeInstanceOf(SendPausedError);
+    expect((result as SendPausedError).pauseMs).toBe(pauseMs);
+  });
+
+  it.each([
+    ['unknown recipient', { code: 'EENVELOPE', responseCode: 550, response: '550-5.1.1 The email account does not exist' }],
+    ['message rejected', { responseCode: 552, response: '552-5.2.3 Message too large' }],
+  ])('fails only this email on %s', async (_label, error) => {
+    await expect(failing(error).send(email)).rejects.toBeInstanceOf(PermanentSendError);
+  });
+
+  it('retries network problems with backoff', async () => {
+    const result = await failing({ code: 'ETIMEDOUT' }).send(email).catch((e: unknown) => e);
+    expect(result).toBeInstanceOf(Error);
+    expect(result).not.toBeInstanceOf(SendPausedError);
+    expect(result).not.toBeInstanceOf(PermanentSendError);
+  });
+
+  it('never puts the password in an error message', () => {
+    const error = classifySmtpError(Object.assign(new Error('Invalid login'), { code: 'EAUTH', responseCode: 535 }));
+    expect(error.message).not.toContain('app-password');
   });
 });
