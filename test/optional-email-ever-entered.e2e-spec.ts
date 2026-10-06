@@ -58,8 +58,23 @@ describe('Optional email and Ever entered (e2e)', () => {
       expect((await regOf('Bina')).person.email).toBe('c@gmail.com');
       await submitRow(ctx, 'r3', row('Chetan', { 'Email Address': 'e@gmail.com' })).expect(200);
       expect((await regOf('Chetan')).person.email).toBe('e@gmail.com');
-      const mails = await outbox(EmailTemplate.RegistrationReceived);
-      expect(mails.map((m) => m.toEmail).sort()).toEqual(['a@gmail.com', 'c@gmail.com', 'e@gmail.com']);
+      // The form import itself sends no email.
+      expect(await outbox()).toHaveLength(0);
+    });
+
+    it('importing, resyncing and editing a response never queues a "registration received" email', async () => {
+      await submitRow(ctx, 'r1', row('Asha', { 'Email Address': 'asha@gmail.com' })).expect(200); // new
+      await submitRow(ctx, 'r1', row('Asha', { 'Email Address': 'asha@gmail.com' })).expect(200); // resync
+      await submitRow(ctx, 'r1', row('Asha', { 'Email Address': 'asha@gmail.com' }, { Sports: 'Table Tennis, Chess' })).expect(200); // edited
+      const team = {
+        'Team Name': 'Smash', Sports: 'Badminton', 'College Name': 'NIT Patna',
+        'Member 1 Name': 'Bina', 'Member 1 Email': 'bina@gmail.com', 'Member 2 Name': 'Chetan', 'Member 2 Email': 'chetan@gmail.com',
+      };
+      const res = await submitRow(ctx, 't1', team).expect(200);
+      expect(res.body).toMatchObject({ ok: true, queuedEmails: 0 });
+      expect(await ctx.prisma.registration.count()).toBe(4);
+      expect(await outbox(EmailTemplate.RegistrationReceived)).toHaveLength(0);
+      expect(await outbox()).toHaveLength(0);
     });
 
     it('2. "Email Address" empty -> "Email" is used', async () => {
@@ -153,7 +168,7 @@ describe('Optional email and Ever entered (e2e)', () => {
       await verify('Asha');
       const qr = await outbox(EmailTemplate.QrPass);
       expect(qr.map((m) => [m.toEmail, m.idempotencyKey])).toEqual([['asha@gmail.com', `qr-pass:${(await regOf('Asha')).id}:initial`]]);
-      expect(await outbox(EmailTemplate.RegistrationReceived)).toHaveLength(1);
+      expect(await outbox(EmailTemplate.RegistrationReceived)).toHaveLength(0); // none on import
     });
 
     it('9. resyncs of a no-email row never create another person (before and after Change email)', async () => {
@@ -174,7 +189,7 @@ describe('Optional email and Ever entered (e2e)', () => {
       expect(await outbox()).toHaveLength(2); // registration + QR, once each
     });
 
-    it('9b. a resynced row that now carries an email gives it to the same person, emailing once', async () => {
+    it('9b. a resynced row that now carries an email gives it to the same person; only the QR email is queued', async () => {
       await submitRow(ctx, 'r1', row('Asha')).expect(200);
       await verify('Asha');
       const before = await regOf('Asha');
@@ -185,7 +200,7 @@ describe('Optional email and Ever entered (e2e)', () => {
       expect(after.person.id).toBe(before.person.id);
       expect(after.person.email).toBe('asha@gmail.com');
       expect(after.person.qrToken).toBe(before.person.qrToken);
-      expect((await outbox()).map((m) => m.template).sort()).toEqual([EmailTemplate.QrPass, EmailTemplate.RegistrationReceived]);
+      expect((await outbox()).map((m) => m.template)).toEqual([EmailTemplate.QrPass]); // no "registration received" on import
     });
 
     it('11. duplicate clicks / webhooks / verifications cannot queue duplicate emails', async () => {

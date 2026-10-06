@@ -576,7 +576,8 @@ horizontal page overflow.
 ## 34. Email worker (Resend or SMTP)
 
 All emails go through `EmailOutbox`:
-- registration received
+- registration received (only when staff add the first email of a participant who had none;
+  form imports and resyncs send no email)
 - QR pass
 - rejection
 - college bulk emails

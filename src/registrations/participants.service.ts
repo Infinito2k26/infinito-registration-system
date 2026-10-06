@@ -56,14 +56,20 @@ export class ParticipantsService {
   /**
    * A participant who had NO email now has one (staff Change email, or a resynced form row).
    * Queues, to that address, what they could not be sent before:
-   *   - the normal "registration received" email for every registration, and
+   *   - the normal "registration received" email for every registration (staff Change email
+   *     only; a form import/resync passes `registrationEmail: false`), and
    *   - the QR pass email for every VERIFIED registration (same existing QR token).
    * Pending registrations get no QR email here; verification queues it as usual.
    * The idempotency keys are the ones ingest/verification use, so repeating this (double
    * click, resync, retry) or a later verification never sends either email twice.
    * Call inside the transaction that set the email.
    */
-  async queueEmailsForNewAddress(tx: Prisma.TransactionClient, personId: string, actorId?: string): Promise<NewAddressEmails> {
+  async queueEmailsForNewAddress(
+    tx: Prisma.TransactionClient,
+    personId: string,
+    actorId?: string,
+    options: { registrationEmail: boolean } = { registrationEmail: true },
+  ): Promise<NewAddressEmails> {
     const person = await tx.person.findUniqueOrThrow({
       where: { id: personId },
       include: {
@@ -77,7 +83,7 @@ export class ParticipantsService {
     if (!email) return { registrationEmails: 0, qrEmails: 0 };
 
     const registrationEmails = await this.outbox.enqueue(
-      person.registrations.map((reg) => ({
+      (options.registrationEmail ? person.registrations : []).map((reg) => ({
         idempotencyKey: registrationReceivedKey(reg.eventSlug, personId),
         personId,
         registrationId: reg.id,

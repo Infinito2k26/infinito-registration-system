@@ -164,7 +164,9 @@ describe('Infinito registration system (e2e)', () => {
       expect(await prisma.person.count()).toBe(2);
       expect(await prisma.team.count()).toBe(1);
       expect(await prisma.registration.count()).toBe(2);
-      expect(await prisma.emailOutbox.count({ where: { template: EmailTemplate.RegistrationReceived } })).toBe(2);
+      // Import and resync send no "registration received" email (nor any other).
+      expect(await prisma.emailOutbox.count({ where: { template: EmailTemplate.RegistrationReceived } })).toBe(0);
+      expect(await prisma.emailOutbox.count()).toBe(0);
     });
 
     it('a duplicate submission (new row, same people) moves them instead of duplicating', async () => {
