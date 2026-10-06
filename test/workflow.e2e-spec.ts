@@ -104,7 +104,7 @@ describe('Individual form workflow (e2e)', () => {
       expect(dump).not.toContain('5678');
       expect(people[0].aadhaarEncrypted).not.toContain('123456789012');
       expect(await ctx.prisma.emailOutbox.count({ where: { template: EmailTemplate.QrPass } })).toBe(0);
-      expect(await ctx.prisma.emailOutbox.count({ where: { template: EmailTemplate.RegistrationReceived } })).toBe(1);
+      expect(await ctx.prisma.emailOutbox.count({ where: { template: EmailTemplate.RegistrationReceived } })).toBe(0);
     });
 
     it('resync and duplicate submissions never duplicate people or registrations; colleges are grouped', async () => {

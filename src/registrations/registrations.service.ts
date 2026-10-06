@@ -1,14 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ActivityType, PaymentStatus, Prisma } from '@prisma/client';
 import { AppConfig } from '../config/app-config.service';
-import { EmailTemplate } from '../emails/email-templates';
-import { EmailOutboxService } from '../emails/email-outbox.service';
 import { ParsedMember, ParsedSubmission } from '../forms/form-response.parser';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityEntry, recordActivity } from './activity';
 import { encryptAadhaar } from './aadhaar-crypto';
 import { collegeDisplayName, collegeNameKey } from './college';
-import { ParticipantsService, emailOwnedByOther, registrationReceivedKey } from './participants.service';
+import { ParticipantsService, emailOwnedByOther } from './participants.service';
 
 export interface IngestSource {
   eventSlug: string;
@@ -56,15 +54,14 @@ export class RegistrationsService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly outbox: EmailOutboxService,
     private readonly config: AppConfig,
     private readonly participants: ParticipantsService,
   ) {}
 
   /**
    * Upserts one form response: a Team, a Person per member (one person per email,
-   * shared across events), TeamMember rows and one Registration per member, and
-   * queues a "registration received" email per member. All-or-nothing.
+   * shared across events), TeamMember rows and one Registration per member. All-or-nothing.
+   * No "registration received" email is sent on import or resync.
    * QR tokens are not created here; see PaymentsService.verifyTeam.
    *
    * Re-submitting (Apps Script retry, resync, or an edited response) is idempotent.
@@ -274,7 +271,6 @@ export class RegistrationsService {
     };
 
     const activity: ActivityEntry[] = [];
-    const registrationIdByPerson = new Map<string, string>();
     for (const { member, person } of people) {
       const role = member.isCaptain ? 'CAPTAIN' : 'MEMBER';
       await tx.teamMember.upsert({
@@ -288,7 +284,6 @@ export class RegistrationsService {
         const created = await tx.registration.create({
           data: { eventSlug, personId: person.id, teamId: team.id, transactionId, ...sourceFields },
         });
-        registrationIdByPerson.set(person.id, created.id);
         activity.push({
           registrationId: created.id,
           type: ActivityType.SUBMITTED,
@@ -326,7 +321,6 @@ export class RegistrationsService {
         where: { id: reg.id },
         data: { team: { connect: { id: team.id } }, ...sourceFields, ...payment },
       });
-      registrationIdByPerson.set(person.id, reg.id);
       activity.push({
         registrationId: reg.id,
         type: ActivityType.UPDATED,
@@ -361,35 +355,9 @@ export class RegistrationsService {
       }
     }
 
-    const eventName = this.config.eventName(eventSlug);
-    // Only people with an email: no job is created that could never be delivered. Someone who
-    // gets an email later is sent this same email then (same idempotency key, so never twice).
-    let queuedEmails = await this.outbox.enqueue(
-      people.flatMap(({ member, person }) =>
-        person.email
-          ? [
-              {
-                idempotencyKey: registrationReceivedKey(eventSlug, person.id),
-                personId: person.id,
-                registrationId: registrationIdByPerson.get(person.id),
-                toEmail: person.email,
-                subject: `Infinito 2K26: registration received for ${eventName}`,
-                template: EmailTemplate.RegistrationReceived,
-                payload: {
-                  name: member.name,
-                  eventName,
-                  team: teamName,
-                  isCaptain: member.isCaptain,
-                  transactionId: transactionId ?? null,
-                },
-              },
-            ]
-          : [],
-      ),
-      tx,
-    );
-    // The form row now carries an email for a participant who had none: their other events'
-    // registration emails and, if already verified, their QR passes go to it as well.
+    // The form row now carries an email for a participant who had none: if already verified,
+    // their QR passes go to it (no "registration received" email on import).
+    let queuedEmails = 0;
     for (const personId of emailAdded) {
       const to = people.find((p) => p.person.id === personId)?.person.email ?? null;
       const regs = await tx.registration.findMany({ where: { personId }, select: { id: true } });
@@ -397,8 +365,8 @@ export class RegistrationsService {
         tx,
         regs.map((r) => ({ registrationId: r.id, type: ActivityType.EMAIL_CHANGED, details: { from: null, to, source: 'form' } })),
       );
-      const queued = await this.participants.queueEmailsForNewAddress(tx, personId);
-      queuedEmails += queued.registrationEmails + queued.qrEmails;
+      const queued = await this.participants.queueEmailsForNewAddress(tx, personId, undefined, { registrationEmail: false });
+      queuedEmails += queued.qrEmails;
     }
 
     this.logger.log(
