@@ -3,6 +3,7 @@ import { CollegeEmailService } from '../emails/college-email.service';
 import { EmailTemplate } from '../emails/email-templates';
 import { formatAadhaar, maskAadhaar } from '../registrations/aadhaar-crypto';
 import { QrEmailSummary } from '../emails/qr-email.service';
+import { BULK_VERIFY_MAX, BulkVerificationService, ReportEmailStatus, reportEmailStatus } from '../payments/bulk-verification.service';
 import { SafeHtml, html } from '../web/html';
 import { BadgeTone, badge, csrfField, fmtDate, fmtDay, fmtExact, paymentBadge } from '../web/layout';
 import {
@@ -25,6 +26,8 @@ type CollegeDetail = NonNullable<Awaited<ReturnType<AdminQueryService['collegePa
 type Batches = Awaited<ReturnType<CollegeEmailService['batches']>>;
 type EntryList = Awaited<ReturnType<AdminQueryService['entries']>>;
 type ExpectedList = Awaited<ReturnType<AdminQueryService['expected']>>;
+type VerificationBatches = Awaited<ReturnType<BulkVerificationService['batches']>>;
+type VerificationBatchDetail = NonNullable<Awaited<ReturnType<BulkVerificationService['batch']>>>;
 type EventName = (slug: string) => string;
 
 const who = (u: { name: string | null; email: string } | null | undefined) => (u ? u.name || u.email : 'system');
@@ -120,8 +123,11 @@ export function registrationsPage(args: {
   events: EventSummary;
   collegeName?: string;
   eventName: EventName;
+  /** Set for ADMINs only: enables "Verify Selected" on the Pending view. */
+  bulkVerifyCsrf?: string;
 }): SafeHtml {
   const { filters, list, events, eventName } = args;
+  const bulk = args.bulkVerifyCsrf && filters.view === 'PENDING' ? args.bulkVerifyCsrf : null;
   const base = {
     event: filters.event,
     college: filters.college,
@@ -170,13 +176,24 @@ export function registrationsPage(args: {
         ${chip(undefined, 'All', c.total)}
         ${(Object.keys(VIEW_LABEL) as RegistrationView[]).map((v) => chip(v, VIEW_LABEL[v], counts[v]))}
       </div>
+      ${
+        bulk && list.registrations.length
+          ? html`<form id="bulk-verify" method="post" action="/admin/registrations/bulk-verify" class="row-form" data-bulk-verify>
+              ${csrfField(bulk)}
+              <input type="hidden" name="back" value="/admin/registrations${buildQuery({ ...base, status: 'pending', page: filters.page > 1 ? filters.page : undefined })}">
+              <button class="primary" data-bulk-submit>Verify selected</button>
+              <span class="muted small">Admins only. Each selected registration is verified exactly like its Verify button (its whole form response) and gets the same QR email. Up to ${BULK_VERIFY_MAX} at a time.</span>
+            </form>`
+          : null
+      }
       <div class="table-wrap">
       <table class="table rows-clickable">
-        <thead><tr><th>Participant</th>${filters.event ? null : html`<th>Event</th>`}<th>College</th><th>Contact</th><th>Status</th><th>Gate</th><th>Registered</th></tr></thead>
+        <thead><tr>${bulk ? html`<th><input type="checkbox" data-select-all aria-label="Select all registrations on this page"></th>` : null}<th>Participant</th>${filters.event ? null : html`<th>Event</th>`}<th>College</th><th>Contact</th><th>Status</th><th>Gate</th><th>Registered</th></tr></thead>
         <tbody>
           ${list.registrations.map((r) => {
             const team = r.team && r.team._count.registrations > 1 ? r.team : null;
             return html`<tr data-href="/admin/registrations/${r.id}">
+              ${bulk ? html`<td><input type="checkbox" name="ids" value="${r.id}" form="bulk-verify" data-bulk-row aria-label="Select ${r.person.name ?? 'participant'}"></td>` : null}
               <td><a href="/admin/registrations/${r.id}">${r.person.name ?? r.person.email}</a>${
                 team
                   ? html`<br><span class="small">team <a href="/admin/teams/${team.id}">${team.name}</a> (${team._count.registrations})</span>`
@@ -196,7 +213,7 @@ export function registrationsPage(args: {
               <td class="small">${fmtDate(r.createdAt)}</td>
             </tr>`;
           })}
-          ${empty ? html`<tr><td colspan="7" class="muted center">${empty}</td></tr>` : null}
+          ${empty ? html`<tr><td colspan="${bulk ? 8 : 7}" class="muted center">${empty}</td></tr>` : null}
         </tbody>
       </table>
       </div>
@@ -982,4 +999,102 @@ export function expectedPage(args: {
         ${list.rows.length === 0 ? html`<tr><td colspan="8" class="muted center">No one has this planned date.</td></tr>` : null}
       </tbody>
     </table></div></section>`;
+}
+
+const REPORT_EMAIL: Record<ReportEmailStatus, [string, BadgeTone]> = {
+  NO_EMAIL: ['No email address', 'muted'],
+  NOT_QUEUED: ['Not queued', 'muted'],
+  QUEUED: ['Queued', 'warn'],
+  SENDING: ['Sending', 'warn'],
+  SENT: ['Sent (accepted by mail server)', 'ok'],
+  DELIVERED: ['Delivered', 'ok'],
+  DELAYED: ['Sent, delivery delayed', 'warn'],
+  FAILED: ['Failed', 'bad'],
+  BOUNCED: ['Bounced after sending', 'bad'],
+  CANCELLED: ['Cancelled (verification undone/rejected)', 'muted'],
+};
+
+const OUTCOME_BADGE: Record<string, BadgeTone> = { VERIFIED: 'ok', SKIPPED: 'muted', FAILED: 'bad' };
+
+/** Admin report of bulk verifications and their QR emails, for a day / date range. */
+export function verificationReportPage(args: { from: Date; to: Date; batches: VerificationBatches }): SafeHtml {
+  const { batches } = args;
+  const sum = (pick: (b: VerificationBatches[number]) => number) => batches.reduce((n, b) => n + pick(b), 0);
+  const tile = (label: string, value: number, tone = '') => html`<div class="counter ${tone}"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+  const range = isoDay(args.from) === isoDay(args.to) ? fmtDay(args.from) : `${fmtDay(args.from)} to ${fmtDay(args.to)}`;
+  return html`<h1>Verification log</h1>
+    <form method="get" action="/admin/verification-report" class="row-form search">
+      <label class="small">From <input type="date" name="from" value="${isoDay(args.from)}"></label>
+      <label class="small">To <input type="date" name="to" value="${isoDay(args.to)}"></label>
+      <button>Show</button>
+      <a href="/admin/verification-report">Today</a>
+    </form>
+    <p class="muted">${range} (India time): ${batches.length} bulk verification(s). Email progress is read live from the email queue.</p>
+    <div class="counters">
+      ${tile('Selected', sum((b) => b.selectedCount))}
+      ${tile('Verified', sum((b) => b.verifiedCount), 'ok')}
+      ${tile('Skipped', sum((b) => b.skippedCount))}
+      ${tile('Failed', sum((b) => b.failedCount), sum((b) => b.failedCount) ? 'bad' : '')}
+      ${tile('QR emails queued', sum((b) => b.qrEmailsQueued), 'info')}
+      ${tile('Emails sent', sum((b) => b.email.sent), 'ok')}
+      ${tile('Emails pending', sum((b) => b.email.pending), 'warn')}
+      ${tile('Email failures', sum((b) => b.email.failed), sum((b) => b.email.failed) ? 'bad' : '')}
+      ${tile('No email', sum((b) => b.noEmailCount))}
+    </div>
+    <div class="table-wrap">
+    <table class="table rows-clickable">
+      <thead><tr><th>Date / time</th><th>By</th><th class="num">Selected</th><th class="num">Verified</th><th class="num">Skipped</th><th class="num">Failed</th><th class="num">QR queued</th><th class="num">Sent</th><th class="num">Pending</th><th class="num">Email failed</th><th class="num">No email</th></tr></thead>
+      <tbody>
+        ${batches.map(
+          (b) => html`<tr data-href="/admin/verification-report/${b.id}">
+            <td><a href="/admin/verification-report/${b.id}">${fmtExact(b.createdAt)}</a></td><td class="small">${who(b.triggeredBy)}</td>
+            <td class="num">${b.selectedCount}</td><td class="num">${b.verifiedCount}</td><td class="num">${b.skippedCount}</td><td class="num">${b.failedCount}</td>
+            <td class="num">${b.qrEmailsQueued}</td><td class="num">${b.email.sent}</td><td class="num">${b.email.pending}</td><td class="num">${b.email.failed}</td><td class="num">${b.noEmailCount}</td>
+          </tr>`,
+        )}
+        ${batches.length === 0 ? html`<tr><td colspan="11" class="muted center">No bulk verifications in this period.</td></tr>` : null}
+      </tbody>
+    </table>
+    </div>`;
+}
+
+/** One bulk verification: totals and every registration with its verification and email status. */
+export function verificationBatchPage(args: { batch: VerificationBatchDetail; eventName: EventName }): SafeHtml {
+  const { batch, eventName } = args;
+  const tile = (label: string, value: number, tone = '') => html`<div class="counter ${tone}"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+  return html`<p class="small"><a href="/admin/verification-report">← Verification log</a></p>
+    <h1>Bulk verification</h1>
+    <p class="muted">${fmtExact(batch.createdAt)} by ${who(batch.triggeredBy)} · <span class="mono small">${batch.id}</span></p>
+    <div class="counters">
+      ${tile('Selected', batch.selectedCount)}
+      ${tile('Verified', batch.verifiedCount, 'ok')}
+      ${tile('Skipped', batch.skippedCount)}
+      ${tile('Failed', batch.failedCount, batch.failedCount ? 'bad' : '')}
+      ${tile('QR emails queued', batch.qrEmailsQueued, 'info')}
+      ${tile('Emails sent', batch.email.sent, 'ok')}
+      ${tile('Emails pending', batch.email.pending, 'warn')}
+      ${tile('Email failures', batch.email.failed, batch.email.failed ? 'bad' : '')}
+      ${tile('No email', batch.noEmailCount)}
+    </div>
+    <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Participant</th><th>Email</th><th>Event</th><th>Verification</th><th>Email status</th><th>Queued</th><th>Sent</th><th>Reason / error</th></tr></thead>
+      <tbody>
+        ${batch.items.map((i) => {
+          const [label, tone] = REPORT_EMAIL[reportEmailStatus(i)];
+          const row = i.emailOutbox;
+          return html`<tr>
+            <td>${i.registrationId ? html`<a href="/admin/registrations/${i.registrationId}">${i.personName ?? 'Participant'}</a>` : i.personName ?? html`<span class="muted">unknown</span>`}${i.selected ? null : html`<br><span class="muted small">teammate (not selected)</span>`}</td>
+            <td class="small">${i.email ?? html`<span class="muted">none</span>`}</td>
+            <td class="small">${i.eventSlug ? eventName(i.eventSlug) : ''}</td>
+            <td>${badge(i.outcome.charAt(0) + i.outcome.slice(1).toLowerCase(), OUTCOME_BADGE[i.outcome])}${i.registration && i.registration.paymentStatus !== PaymentStatus.VERIFIED && i.outcome === 'VERIFIED' ? html`<br><span class="muted small">now ${i.registration.paymentStatus.toLowerCase()}</span>` : null}</td>
+            <td>${badge(label, tone)}</td>
+            <td class="small">${row ? fmtExact(row.sendAt > row.createdAt ? row.sendAt : row.createdAt) : ''}</td>
+            <td class="small">${row?.sentAt ? fmtExact(row.sentAt) : ''}</td>
+            <td class="small">${i.reason ?? ''}${row?.status === 'FAILED' && row.lastError ? html`${i.reason ? html`<br>` : null}<span class="error-text">${row.lastError}</span>` : null}</td>
+          </tr>`;
+        })}
+      </tbody>
+    </table>
+    </div>`;
 }

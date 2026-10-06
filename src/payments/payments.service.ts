@@ -21,6 +21,17 @@ export interface PaymentActionResult {
   changed: number;
   emailsQueued: number;
   message: string;
+  /** verifyTeam only: the registrations this call verified (bulk verification reports per row). */
+  verifiedRegistrationIds?: string[];
+}
+
+export interface VerifyOptions {
+  /**
+   * Bulk verify: checked inside the team lock. If none of these registrations is still PENDING
+   * (verified or rejected meanwhile by someone else), nothing is changed. Individual Verify
+   * does not pass it, so its behaviour is unchanged.
+   */
+  onlyIfPending?: string[];
 }
 
 type Tx = Prisma.TransactionClient;
@@ -42,11 +53,17 @@ export class PaymentsService {
     private readonly config: AppConfig,
   ) {}
 
-  async verifyTeam(teamId: string, actorId: string): Promise<PaymentActionResult> {
+  async verifyTeam(teamId: string, actorId: string, options: VerifyOptions = {}): Promise<PaymentActionResult> {
     return this.inTeamLock(teamId, async (tx, team) => {
+      if (options.onlyIfPending) {
+        const wanted = new Set(options.onlyIfPending);
+        if (!team.registrations.some((r) => wanted.has(r.id) && r.paymentStatus === PaymentStatus.PENDING)) {
+          return { changed: 0, emailsQueued: 0, message: 'No longer pending; nothing changed', verifiedRegistrationIds: [] };
+        }
+      }
       const toVerify = team.registrations.filter((r) => r.paymentStatus !== PaymentStatus.VERIFIED);
       if (toVerify.length === 0) {
-        return { changed: 0, emailsQueued: 0, message: 'Already verified; no emails sent' };
+        return { changed: 0, emailsQueued: 0, message: 'Already verified; no emails sent', verifiedRegistrationIds: [] };
       }
 
       const txn = team.registrations.find((r) => r.transactionId)?.transactionId;
@@ -113,6 +130,7 @@ export class PaymentsService {
       return {
         changed: toVerify.length,
         emailsQueued,
+        verifiedRegistrationIds: toVerify.map((r) => r.id),
         message:
           `Verified ${toVerify.length} participant(s); ${emailsQueued} QR email(s) go out in ${this.config.decisionEmailDelaySeconds}s unless undone` +
           (withoutEmail ? `; ${withoutEmail} without an email (QR pass created; it is emailed once an email is added)` : ''),

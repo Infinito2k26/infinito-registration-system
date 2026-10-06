@@ -79,12 +79,14 @@ export type NavSection =
   | 'entries'
   | 'scan'
   | 'find'
+  | 'verifications'
   | 'staff';
 
 /**
  * Navigation per role. This only decides what is shown; every target route is also protected
  * on the server (@Roles / StaffGuard), so a hidden item is never the only barrier.
- *   ADMIN:       Dashboard, Inside, Outside, Ever entered, Blocked, Arrivals, Gate log, Colleges, Scan, Staff
+ *   ADMIN:       Dashboard, Inside, Outside, Ever entered, Blocked, Arrivals, Gate log, Colleges, Scan,
+ *                Verification log, Staff
  *   COORDINATOR: the same without Staff
  *   VOLUNTEER:   Scan, Find participant
  */
@@ -105,7 +107,12 @@ export function navItems(role: StaffRole): { key: NavSection; href: string; labe
     { key: 'entries', href: '/admin/entries', label: 'Gate log' },
     { key: 'colleges', href: '/admin/colleges', label: 'Colleges' },
     { key: 'scan', href: '/scan', label: 'Scan' },
-    ...(role === StaffRole.ADMIN ? [{ key: 'staff' as const, href: '/admin/staff', label: 'Staff' }] : []),
+    ...(role === StaffRole.ADMIN
+      ? [
+          { key: 'verifications' as const, href: '/admin/verification-report', label: 'Verification log' },
+          { key: 'staff' as const, href: '/admin/staff', label: 'Staff' },
+        ]
+      : []),
   ];
 }
 

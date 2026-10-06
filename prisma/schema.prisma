@@ -236,11 +236,12 @@ model Registration {
   createdAt             DateTime           @default(now())
   updatedAt             DateTime           @updatedAt
 
-  person            Person                 @relation(fields: [personId], references: [id], onDelete: Cascade)
-  team              Team?                  @relation(fields: [teamId], references: [id], onDelete: SetNull)
-  enteredBy         StaffUser?             @relation("RegistrationEnteredBy", fields: [enteredById], references: [id], onDelete: SetNull)
-  paymentReviewedBy StaffUser?             @relation("RegistrationReviewedBy", fields: [paymentReviewedById], references: [id], onDelete: SetNull)
+  person            Person                  @relation(fields: [personId], references: [id], onDelete: Cascade)
+  team              Team?                   @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  enteredBy         StaffUser?              @relation("RegistrationEnteredBy", fields: [enteredById], references: [id], onDelete: SetNull)
+  paymentReviewedBy StaffUser?              @relation("RegistrationReviewedBy", fields: [paymentReviewedById], references: [id], onDelete: SetNull)
   activities        RegistrationActivity[]
+  verificationItems VerificationBatchItem[]
   emails            EmailOutbox[]
   entryLogs         EntryLog[]
 
@@ -313,6 +314,7 @@ model StaffUser {
   activities            RegistrationActivity[]
   triggeredEmails       EmailOutbox[]
   emailBatches          EmailBatch[]
+  verificationBatches   VerificationBatch[]
   blockedPeople         Person[]               @relation("PersonBlockedBy")
 }
 
@@ -358,10 +360,11 @@ model EmailOutbox {
   createdAt         DateTime             @default(now())
   updatedAt         DateTime             @updatedAt
 
-  person       Person?       @relation(fields: [personId], references: [id], onDelete: SetNull)
-  registration Registration? @relation(fields: [registrationId], references: [id], onDelete: SetNull)
-  triggeredBy  StaffUser?    @relation(fields: [triggeredById], references: [id], onDelete: SetNull)
-  batch        EmailBatch?   @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  person            Person?                 @relation(fields: [personId], references: [id], onDelete: SetNull)
+  registration      Registration?           @relation(fields: [registrationId], references: [id], onDelete: SetNull)
+  triggeredBy       StaffUser?              @relation(fields: [triggeredById], references: [id], onDelete: SetNull)
+  batch             EmailBatch?             @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  verificationItems VerificationBatchItem[]
 
   @@index([status, sendAt])
   @@index([batchId])
@@ -389,4 +392,56 @@ model EmailBatch {
   emails          EmailOutbox[]
 
   @@index([collegeId, createdAt])
+}
+
+enum VerificationBatchOutcome {
+  VERIFIED
+  SKIPPED
+  FAILED
+}
+
+/// One admin "Verify Selected" run. Every registration in it went through the normal Verify
+/// (PaymentsService.verifyTeam); the counts are a snapshot at the end of the run. Email
+/// progress (sent / failed / pending) is read live from the linked EmailOutbox rows.
+model VerificationBatch {
+  id             String   @id @default(uuid()) @db.Uuid
+  triggeredById  String?  @db.Uuid
+  selectedCount  Int
+  verifiedCount  Int      @default(0)
+  skippedCount   Int      @default(0)
+  failedCount    Int      @default(0)
+  qrEmailsQueued Int      @default(0)
+  noEmailCount   Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  triggeredBy StaffUser?              @relation(fields: [triggeredById], references: [id], onDelete: SetNull)
+  items       VerificationBatchItem[]
+
+  @@index([createdAt])
+}
+
+/// One registration in a bulk run: a selected one (VERIFIED / SKIPPED / FAILED with reason) or a
+/// teammate verified with it (same form response, as the individual Verify does).
+model VerificationBatchItem {
+  id             String                   @id @default(uuid()) @db.Uuid
+  batchId        String                   @db.Uuid
+  registrationId String?                  @db.Uuid
+  /// Snapshot when verified, so the report keeps showing who it was.
+  personName     String?
+  /// Address the QR email was queued to; null = the participant had no email.
+  email          String?
+  eventSlug      String
+  selected       Boolean                  @default(true)
+  outcome        VerificationBatchOutcome
+  reason         String?
+  /// The automatic QR pass email (same row as an individual Verify queues).
+  emailOutboxId  String?                  @db.Uuid
+  createdAt      DateTime                 @default(now())
+
+  batch        VerificationBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  registration Registration?     @relation(fields: [registrationId], references: [id], onDelete: SetNull)
+  emailOutbox  EmailOutbox?      @relation(fields: [emailOutboxId], references: [id], onDelete: SetNull)
+
+  @@index([batchId])
+  @@index([registrationId])
 }
