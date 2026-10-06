@@ -23,6 +23,7 @@ import { CollegeEmailService } from '../emails/college-email.service';
 import { QrEmailError, QrEmailService } from '../emails/qr-email.service';
 import { checkInFlash, checkOutFlash } from '../entry/entry-messages';
 import { EntryService } from '../entry/entry.service';
+import { BULK_VERIFY_MAX, BulkVerificationService } from '../payments/bulk-verification.service';
 import { PaymentActionError, PaymentsService } from '../payments/payments.service';
 import { ParticipantActionError, ParticipantsService, changeEmailMessage } from '../registrations/participants.service';
 import { Flash, setFlash, takeFlash } from '../web/cookies';
@@ -40,6 +41,8 @@ import {
   participantPage,
   registrationsPage,
   teamPage,
+  verificationBatchPage,
+  verificationReportPage,
 } from './admin.views';
 
 type Decision = 'verify' | 'reject' | 'undo';
@@ -59,6 +62,9 @@ const text = (value: unknown, max: number) => (typeof value === 'string' ? value
 /** Today's / tomorrow's date at the fest (India), as YYYY-MM-DD. */
 const festDay = (offsetDays = 0) =>
   new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date(Date.now() + offsetDays * 86_400_000));
+
+/** The instant a fest (India) day begins, from its DATE value (UTC midnight of that day). */
+const festDayStart = (day: Date) => new Date(day.getTime() - 330 * 60_000);
 
 /** "today" | "tomorrow" | "YYYY-MM-DD" -> a DATE-column value; anything else -> undefined. */
 function parseDay(value: unknown): Date | undefined {
@@ -81,6 +87,7 @@ export class AdminController {
   constructor(
     private readonly queries: AdminQueryService,
     private readonly payments: PaymentsService,
+    private readonly bulkVerification: BulkVerificationService,
     private readonly qrEmails: QrEmailService,
     private readonly collegeEmails: CollegeEmailService,
     private readonly participants: ParticipantsService,
@@ -155,7 +162,15 @@ export class AdminController {
       filters.view === 'INSIDE' || filters.view === 'OUTSIDE' || filters.view === 'ENTERED' || filters.view === 'BLOCKED'
         ? (filters.view.toLowerCase() as NavSection)
         : 'registrations',
-      registrationsPage({ filters, list, events, collegeName: collegeRow ?? undefined, eventName: this.eventName }),
+      registrationsPage({
+        filters,
+        list,
+        events,
+        collegeName: collegeRow ?? undefined,
+        eventName: this.eventName,
+        // Bulk verify: admins only (the POST route checks the role again).
+        bulkVerifyCsrf: req.staff!.role === StaffRole.ADMIN ? this.auth.csrfToken(req.staff!.sessionId) : undefined,
+      }),
     );
   }
 
@@ -392,6 +407,52 @@ export class AdminController {
       'expected',
       expectedPage({ kind, day, today: festDay(), tomorrow: festDay(1), list, event, college, events, colleges, eventName: this.eventName }),
     );
+  }
+
+  // ---------- bulk verification (ADMIN only) ----------
+
+  /**
+   * "Verify Selected" on the Pending list. Each selected registration goes through the normal
+   * Verify (PaymentsService.verifyTeam via BulkVerificationService); the result opens as a report.
+   */
+  @Post('registrations/bulk-verify')
+  @Roles(StaffRole.ADMIN)
+  async bulkVerify(@Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
+    const raw = Array.isArray(body.ids) ? body.ids : body.ids === undefined ? [] : [body.ids];
+    const ids = [...new Set(raw.filter((id): id is string => typeof id === 'string' && UUID.test(id)))];
+    const back = typeof body.back === 'string' && body.back.startsWith('/admin/registrations') ? body.back : '/admin/registrations?status=pending';
+    if (ids.length === 0) {
+      this.flashAndBack(res, { type: 'error', text: 'No registrations selected' }, back);
+      return;
+    }
+    if (ids.length > BULK_VERIFY_MAX) {
+      this.flashAndBack(res, { type: 'error', text: `Select at most ${BULK_VERIFY_MAX} registrations at a time` }, back);
+      return;
+    }
+    const r = await this.bulkVerification.verifySelected(ids, req.staff!.id);
+    const text =
+      `Bulk verify: ${r.selected} selected, ${r.verified} verified${r.teammates ? ` (incl. ${r.teammates} teammate(s))` : ''}, ` +
+      `${r.skipped} skipped, ${r.failed} failed, ${r.qrEmailsQueued} QR email(s) queued, ${r.noEmail} without email`;
+    this.flashAndBack(res, { type: r.failed ? 'error' : 'ok', text }, `/admin/verification-report/${r.batchId}`);
+  }
+
+  /** Bulk verification / QR email report. Default: today (fest time); ?from=&to= for a range. */
+  @Get('verification-report')
+  @Roles(StaffRole.ADMIN)
+  async verificationReport(@Req() req: StaffRequest, @Res() res: Response, @Query('from') fromParam?: string, @Query('to') toParam?: string) {
+    const from = parseDay(fromParam) ?? dateOnly(festDay());
+    let to = parseDay(toParam) ?? from;
+    if (to < from) to = from;
+    const batches = await this.bulkVerification.batches(festDayStart(from), festDayStart(new Date(to.getTime() + 86_400_000)));
+    this.render(req, res, 'Verification log', 'verifications', verificationReportPage({ from, to, batches }));
+  }
+
+  @Get('verification-report/:id')
+  @Roles(StaffRole.ADMIN)
+  async verificationBatch(@Param('id', ParseUUIDPipe) id: string, @Req() req: StaffRequest, @Res() res: Response) {
+    const batch = await this.bulkVerification.batch(id);
+    if (!batch) throw new NotFoundException('Bulk verification not found');
+    this.render(req, res, 'Bulk verification', 'verifications', verificationBatchPage({ batch, eventName: this.eventName }));
   }
 
   // ---------- gate log ----------
