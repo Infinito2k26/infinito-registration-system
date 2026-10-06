@@ -1,9 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ActivityType, EmailStatus, PaymentStatus, Prisma } from '@prisma/client';
 import { z } from 'zod';
-import { AppConfig } from '../config/app-config.service';
-import { EmailOutboxService } from '../emails/email-outbox.service';
-import { EmailTemplate } from '../emails/email-templates';
 import { EmailWorkerService } from '../emails/email-worker.service';
 import { QrEmailService } from '../emails/qr-email.service';
 import { normalizeEmail } from '../forms/form-response.parser';
@@ -24,21 +21,14 @@ export const emailOwnedByOther = (email: string, personId?: string): Prisma.Pers
 
 const emailSchema = z.email();
 
-export const registrationReceivedKey = (eventSlug: string, personId: string) => `registration-received:${eventSlug}:${personId}`;
-
 /** Flash text after a Change email. `shownFrom` lets the gate mask the old address for volunteers. */
 export function changeEmailMessage(result: { from: string | null; to: string; queued: NewAddressEmails }, shownFrom = result.from): string {
   if (result.from) return `Email changed from ${shownFrom} to ${result.to}. No email was sent; use Send QR email if needed.`;
-  const { registrationEmails, qrEmails } = result.queued;
-  return (
-    `Email added: ${result.to}. Queued ${registrationEmails} registration email(s)` +
-    (qrEmails ? ` and ${qrEmails} QR pass email(s).` : '. The QR pass is emailed once the registration is verified.')
-  );
+  const { qrEmails } = result.queued;
+  return `Email added: ${result.to}. ` + (qrEmails ? `Queued ${qrEmails} QR pass email(s).` : 'The QR pass is emailed once the registration is verified.');
 }
 
 export interface NewAddressEmails {
-  /** "Registration received" emails queued now (one per event not emailed before). */
-  registrationEmails: number;
   /** QR pass emails queued now (verified registrations only). */
   qrEmails: number;
 }
@@ -47,29 +37,20 @@ export interface NewAddressEmails {
 export class ParticipantsService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly outbox: EmailOutboxService,
     private readonly qrEmails: QrEmailService,
     private readonly worker: EmailWorkerService,
-    private readonly config: AppConfig,
   ) {}
 
   /**
    * A participant who had NO email now has one (staff Change email, or a resynced form row).
-   * Queues, to that address, what they could not be sent before:
-   *   - the normal "registration received" email for every registration (staff Change email
-   *     only; a form import/resync passes `registrationEmail: false`), and
-   *   - the QR pass email for every VERIFIED registration (same existing QR token).
-   * Pending registrations get no QR email here; verification queues it as usual.
-   * The idempotency keys are the ones ingest/verification use, so repeating this (double
-   * click, resync, retry) or a later verification never sends either email twice.
+   * Queues the QR pass email, which could not be sent before, for every VERIFIED registration
+   * (same existing QR token). Nothing else: no "registration received" email is ever sent.
+   * Pending registrations get no email here; verification queues the QR email as usual.
+   * The QR email's idempotency key is the one verification uses, so repeating this (double
+   * click, resync, retry) or a later verification never sends it twice.
    * Call inside the transaction that set the email.
    */
-  async queueEmailsForNewAddress(
-    tx: Prisma.TransactionClient,
-    personId: string,
-    actorId?: string,
-    options: { registrationEmail: boolean } = { registrationEmail: true },
-  ): Promise<NewAddressEmails> {
+  async queueEmailsForNewAddress(tx: Prisma.TransactionClient, personId: string, actorId?: string): Promise<NewAddressEmails> {
     const person = await tx.person.findUniqueOrThrow({
       where: { id: personId },
       include: {
@@ -80,28 +61,7 @@ export class ParticipantsService {
       },
     });
     const email = person.email;
-    if (!email) return { registrationEmails: 0, qrEmails: 0 };
-
-    const registrationEmails = await this.outbox.enqueue(
-      (options.registrationEmail ? person.registrations : []).map((reg) => ({
-        idempotencyKey: registrationReceivedKey(reg.eventSlug, personId),
-        personId,
-        registrationId: reg.id,
-        triggeredById: actorId,
-        toEmail: email,
-        subject: `Infinito 2K26: registration received for ${this.config.eventName(reg.eventSlug)}`,
-        template: EmailTemplate.RegistrationReceived,
-        payload: {
-          name: person.name ?? '',
-          eventName: this.config.eventName(reg.eventSlug),
-          team: reg.team?.name ?? person.name ?? '',
-          isCaptain: reg.team?.members[0]?.role === 'CAPTAIN',
-          transactionId: reg.transactionId ?? null,
-          verified: reg.paymentStatus === PaymentStatus.VERIFIED,
-        },
-      })),
-      tx,
-    );
+    if (!email) return { qrEmails: 0 };
 
     let qrEmails = 0;
     const activity: ActivityEntry[] = [];
@@ -113,7 +73,7 @@ export class ParticipantsService {
       activity.push({ registrationId: reg.id, type: ActivityType.QR_EMAIL_QUEUED, actorId, details: { toEmail: email, reason: 'email added' } });
     }
     await recordActivity(tx, activity);
-    return { registrationEmails, qrEmails };
+    return { qrEmails };
   }
 
   /**
@@ -171,8 +131,8 @@ export class ParticipantsService {
    * same verification and entry history. The old address becomes an alias so a resync of an
    * old sheet row maps back to this person instead of recreating the old address. Emails
    * still waiting in the outbox for this person are redirected. Changing an existing email
-   * sends nothing; adding the FIRST email queues what could not be sent before (see
-   * queueEmailsForNewAddress): registration email always, QR email only if verified.
+   * sends nothing; adding the FIRST email queues the QR email if the participant is already
+   * verified (see queueEmailsForNewAddress).
    */
   async changeEmail(
     personId: string,
@@ -228,7 +188,7 @@ export class ParticipantsService {
           details: { from, to, redirectedQueuedEmails: redirected },
         })),
       );
-      const queued = from ? { registrationEmails: 0, qrEmails: 0 } : await this.queueEmailsForNewAddress(tx, personId, actorId);
+      const queued = from ? { qrEmails: 0 } : await this.queueEmailsForNewAddress(tx, personId, actorId);
       return { from, to, queued };
     }).catch((error: unknown) => {
       // A simultaneous change/registration took the address first: the unique constraint on
@@ -238,7 +198,7 @@ export class ParticipantsService {
       }
       throw error;
     });
-    if (result.queued.registrationEmails + result.queued.qrEmails > 0) this.worker.kick();
+    if (result.queued.qrEmails > 0) this.worker.kick();
     return result;
   }
 }

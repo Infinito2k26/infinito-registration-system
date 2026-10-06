@@ -116,13 +116,13 @@ describe('Optional email and Ever entered (e2e)', () => {
       expect(flash(await postAs(ctx, volunteer, `/p/${reg.person.qrToken}/enter`, { registrationId: reg.id }))).toMatch(/^✅ ENTERED/);
     });
 
-    it('5 + 10. verified, no email, email added -> registration email + QR email to it; same QR token', async () => {
+    it('5 + 10. verified, no email, email added -> only the QR email to it; same QR token', async () => {
       await submitRow(ctx, 'r1', row('Asha')).expect(200);
       await verify('Asha');
       const before = await regOf('Asha');
 
       const res = await changeEmail('Asha', 'Asha.New@Gmail.com');
-      expect(flash(res)).toBe('Email added: asha.new@gmail.com. Queued 1 registration email(s) and 1 QR pass email(s).');
+      expect(flash(res)).toBe('Email added: asha.new@gmail.com. Queued 1 QR pass email(s).');
 
       const after = await regOf('Asha');
       expect(after.person.id).toBe(before.person.id);
@@ -130,14 +130,10 @@ describe('Optional email and Ever entered (e2e)', () => {
       expect(after.person.qrToken).toBe(before.person.qrToken); // never regenerated
       expect(after.paymentStatus).toBe(PaymentStatus.VERIFIED);
       const mails = await outbox();
-      expect(mails.map((m) => [m.template, m.toEmail]).sort()).toEqual([
-        [EmailTemplate.QrPass, 'asha.new@gmail.com'],
-        [EmailTemplate.RegistrationReceived, 'asha.new@gmail.com'],
-      ]);
+      expect(mails.map((m) => [m.template, m.toEmail])).toEqual([[EmailTemplate.QrPass, 'asha.new@gmail.com']]);
       const qr = mails.find((m) => m.template === EmailTemplate.QrPass)!;
       expect(qr.idempotencyKey).toBe(`qr-pass:${after.id}:initial`);
       expect((qr.payload as { qrToken: string }).qrToken).toBe(before.person.qrToken);
-      expect((mails.find((m) => m.template === EmailTemplate.RegistrationReceived)!.payload as { verified: boolean }).verified).toBe(true);
       const activity = await ctx.prisma.registrationActivity.findMany({ where: { registrationId: after.id }, orderBy: { createdAt: 'asc' } });
       expect(activity.map((a) => a.type)).toEqual(
         expect.arrayContaining([ActivityType.EMAIL_CHANGED, ActivityType.QR_EMAIL_QUEUED]),
@@ -145,22 +141,38 @@ describe('Optional email and Ever entered (e2e)', () => {
 
       // Changing that email again later sends nothing new (existing behaviour); alias kept.
       expect(flash(await changeEmail('Asha', 'asha.third@gmail.com'))).toMatch(/^Email changed from asha.new@gmail.com to asha.third@gmail.com/);
-      expect(await outbox()).toHaveLength(2);
+      expect(await outbox()).toHaveLength(1);
       expect((await regOf('Asha')).person.qrToken).toBe(before.person.qrToken);
     });
 
-    it('6 + 7. pending, no email, email added -> registration email only; verification later sends the QR email', async () => {
+    it('6 + 7. pending, no email, email added -> no email yet; verification then sends only the QR email', async () => {
       await submitRow(ctx, 'r1', row('Asha')).expect(200);
       expect(flash(await changeEmail('Asha', 'asha@gmail.com'))).toBe(
-        'Email added: asha@gmail.com. Queued 1 registration email(s). The QR pass is emailed once the registration is verified.',
+        'Email added: asha@gmail.com. The QR pass is emailed once the registration is verified.',
       );
-      expect((await outbox()).map((m) => m.template)).toEqual([EmailTemplate.RegistrationReceived]);
-      expect(((await outbox())[0].payload as { verified: boolean }).verified).toBe(false);
+      expect(await outbox()).toHaveLength(0);
 
       await verify('Asha');
-      const qr = await outbox(EmailTemplate.QrPass);
-      expect(qr.map((m) => m.toEmail)).toEqual(['asha@gmail.com']);
-      expect(await outbox(EmailTemplate.RegistrationReceived)).toHaveLength(1);
+      expect((await outbox()).map((m) => [m.template, m.toEmail])).toEqual([[EmailTemplate.QrPass, 'asha@gmail.com']]);
+      expect(await outbox(EmailTemplate.RegistrationReceived)).toHaveLength(0);
+    });
+
+    it('the reported case: imported without email, email added, then Verify (individual or bulk) -> exactly one QR email, no "registration received"', async () => {
+      const admin = await staff(ctx, StaffRole.ADMIN);
+      await submitRow(ctx, 'r1', row('Asha')).expect(200);
+      await submitRow(ctx, 'r2', row('Bina')).expect(200);
+      expect(await outbox()).toHaveLength(0); // import: nothing
+      await changeEmail('Asha', 'asha@gmail.com');
+      await changeEmail('Bina', 'bina@gmail.com');
+      expect(await outbox()).toHaveLength(0); // email added while pending: nothing
+      await verify('Asha'); // individual Verify
+      await postAs(ctx, admin, '/admin/registrations/bulk-verify', { ids: [(await regOf('Bina')).id] } as never).expect(303); // bulk
+      const mails = await outbox();
+      expect(mails.map((m) => [m.template, m.toEmail]).sort()).toEqual([
+        [EmailTemplate.QrPass, 'asha@gmail.com'],
+        [EmailTemplate.QrPass, 'bina@gmail.com'],
+      ]);
+      expect(await ctx.prisma.emailOutbox.count({ where: { template: EmailTemplate.RegistrationReceived } })).toBe(0);
     });
 
     it('8. existing email + verification -> QR email as before', async () => {
@@ -186,7 +198,7 @@ describe('Optional email and Ever entered (e2e)', () => {
       expect(reg.person.email).toBe('asha@gmail.com');
       expect(reg.person.qrToken).toBe(token);
       expect(reg.paymentStatus).toBe(PaymentStatus.VERIFIED);
-      expect(await outbox()).toHaveLength(2); // registration + QR, once each
+      expect((await outbox()).map((m) => m.template)).toEqual([EmailTemplate.QrPass]); // the QR email, once
     });
 
     it('9b. a resynced row that now carries an email gives it to the same person; only the QR email is queued', async () => {
@@ -213,7 +225,7 @@ describe('Optional email and Ever entered (e2e)', () => {
       expect(clicks.every((r) => r.status === 303)).toBe(true);
       await Promise.all(Array.from({ length: 3 }, () => submitRow(ctx, 'r1', row('Asha', { Email: 'asha@gmail.com' }))));
       await Promise.all(Array.from({ length: 3 }, () => postAs(ctx, coordinator, `/admin/registrations/${id}/verify`)));
-      expect(await outbox(EmailTemplate.RegistrationReceived)).toHaveLength(1);
+      expect(await outbox(EmailTemplate.RegistrationReceived)).toHaveLength(0);
       expect(await outbox(EmailTemplate.QrPass)).toHaveLength(1);
       expect(await ctx.prisma.person.count()).toBe(1);
     });

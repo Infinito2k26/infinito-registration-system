@@ -128,7 +128,10 @@ describe('Admin bulk verify and verification report (e2e)', () => {
     // 15 + 16. Same records as the individual Verify button produces.
     await postAs(ctx, admin, `/admin/registrations/${(await reg('Dev')).id}/verify`).expect(303);
     const [bulkRow] = await qrRows(asha);
-    const [single] = await qrRows((await reg('Dev')).id);
+    const devRows = await qrRows((await reg('Dev')).id);
+    expect(devRows).toHaveLength(1); // individual Verify: exactly one QR email
+    const [single] = devRows;
+    expect(await ctx.prisma.emailOutbox.count({ where: { template: EmailTemplate.RegistrationReceived } })).toBe(0);
     expect(Object.keys(bulkRow.payload as object).sort()).toEqual(Object.keys(single.payload as object).sort());
     expect([bulkRow.subject.replace('Asha', 'X'), bulkRow.template]).toEqual([single.subject.replace('Dev', 'X'), single.template]);
     expect((bulkRow.payload as { qrToken: string }).qrToken).toBe((await reg('Asha')).person.qrToken);
