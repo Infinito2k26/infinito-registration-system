@@ -3,6 +3,15 @@ import { StaffRole } from '@prisma/client';
 import { Response } from 'express';
 import { z } from 'zod';
 import { AppConfig } from '../config/app-config.service';
+import {
+  EMAIL_PROVIDERS,
+  EmailProviderError,
+  EmailProviderService,
+  isEmailProvider,
+  notConfiguredMessage,
+  providerLabel,
+} from '../emails/email-provider.service';
+import { EmailWorkerService } from '../emails/email-worker.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { setFlash, takeFlash } from '../web/cookies';
 import { html } from '../web/html';
@@ -28,7 +37,16 @@ export class StaffController {
     private readonly prisma: PrismaService,
     private readonly auth: AuthService,
     private readonly config: AppConfig,
+    private readonly emailProviders: EmailProviderService,
+    private readonly emailWorker: EmailWorkerService,
   ) {}
+
+  /** Active email provider and both providers' (non-secret) status. */
+  private async emailProviderState() {
+    const active = await this.emailProviders.active();
+    const providers = EMAIL_PROVIDERS.map((p) => this.emailProviders.status(p));
+    return { ...active, providers, activeConfigured: providers.find((p) => p.provider === active.provider)!.configured };
+  }
 
   @Get()
   async list(@Req() req: StaffRequest, @Res() res: Response) {
@@ -37,6 +55,7 @@ export class StaffController {
       include: { sessions: { where: { revokedAt: null }, orderBy: { lastSeenAt: 'desc' }, take: 1 } },
     });
     const csrf = this.auth.csrfToken(req.staff!.sessionId);
+    const email = await this.emailProviderState();
     const roleOptions = (selected: StaffRole) =>
       Object.values(StaffRole).map(
         (r) => html`<option value="${r}" ${r === selected ? 'selected' : ''}>${r.toLowerCase()}</option>`,
@@ -80,9 +99,60 @@ export class StaffController {
               )}
             </tbody>
           </table></div>
+        </section>
+        <section class="card">
+          <h2>Email provider</h2>
+          <p>Active: <b>${providerLabel(email.provider)}</b> · ${
+            email.source === 'admin'
+              ? html`chosen by ${email.updatedBy?.name || email.updatedBy?.email || 'an admin'}, ${fmtDate(email.updatedAt)}`
+              : html`<span class="muted">from .env (EMAIL_PROVIDER)</span>`
+          }</p>
+          ${email.activeConfigured ? null : html`<div class="warning">${notConfiguredMessage(email.provider)} Emails stay queued until it is configured or another provider is chosen.</div>`}
+          <form method="post" action="/admin/staff/email-provider" class="row-form">
+            ${csrfField(csrf)}
+            ${email.providers.map(
+              (p) => html`<label><input type="radio" name="provider" value="${p.provider}" ${p.provider === email.provider ? 'checked' : ''}>
+                ${providerLabel(p.provider)} <span class="muted small">(${p.detail}${p.problems.length ? `; ${p.problems.join('; ')}` : ''})</span></label>`,
+            )}
+            <button class="primary">Save</button>
+          </form>
+          <p class="muted small">Credentials stay in .env; only this choice is saved, and it takes precedence over EMAIL_PROVIDER. Emails already queued go out with the selected provider; nothing is sent twice.</p>
         </section>`,
       }),
     );
+  }
+
+  /** Admin-only: the active email provider (JSON). Never includes credentials. */
+  @Get('email-provider')
+  async getEmailProvider(@Res() res: Response) {
+    const state = await this.emailProviderState();
+    res.set('Cache-Control', 'no-store').json({
+      provider: state.provider,
+      source: state.source,
+      updatedAt: state.updatedAt,
+      updatedBy: state.updatedBy?.email ?? null,
+      sending: this.emailWorker.transportName,
+      providers: state.providers,
+    });
+  }
+
+  /** Admin-only: choose the active email provider ("smtp" | "resend"); it must be configured in .env. */
+  @Post('email-provider')
+  async setEmailProvider(@Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
+    const provider = body.provider;
+    if (!isEmailProvider(provider)) {
+      setFlash(res, { type: 'error', text: 'Choose SMTP or Resend' }, this.config.secureCookies);
+      return res.redirect(303, '/admin/staff');
+    }
+    try {
+      await this.emailProviders.set(provider, req.staff!.id);
+      await this.emailWorker.refreshProvider();
+      setFlash(res, { type: 'ok', text: `Email provider set to ${providerLabel(provider)}` }, this.config.secureCookies);
+    } catch (error) {
+      if (!(error instanceof EmailProviderError)) throw error;
+      setFlash(res, { type: 'error', text: error.message }, this.config.secureCookies);
+    }
+    res.redirect(303, '/admin/staff');
   }
 
   @Post()

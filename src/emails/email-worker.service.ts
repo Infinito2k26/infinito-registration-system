@@ -2,6 +2,7 @@ import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@ne
 import { EmailOutbox, EmailStatus } from '@prisma/client';
 import { AppConfig } from '../config/app-config.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { EmailProvider, EmailProviderService, notConfiguredMessage, providerLabel } from './email-provider.service';
 import { renderEmail } from './email-templates';
 import {
   ConsoleTransport,
@@ -32,7 +33,9 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 @Injectable()
 export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = new Logger(EmailWorkerService.name);
-  private readonly transport: MailTransport | null;
+  /** Sender of the active provider; null = sending disabled (emails stay queued). */
+  private transport: MailTransport | null;
+  private activeProvider: EmailProvider;
   private timer: NodeJS.Timeout | null = null;
   private running = false;
   private rerun = false;
@@ -42,25 +45,32 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: AppConfig,
+    private readonly providers: EmailProviderService,
   ) {
-    this.transport = this.createTransport();
+    // .env default until the admin's saved choice is read (refreshProvider, at start-up and per batch).
+    this.activeProvider = providers.envDefault;
+    this.transport = this.createTransport(this.activeProvider);
   }
 
-  private createTransport(): MailTransport | null {
-    const { provider, smtp, resendApiKey, from, replyTo, testRecipient } = this.config.email;
-    const credentials = provider === 'smtp' ? 'SMTP_HOST / SMTP_USER / SMTP_PASS are' : 'RESEND_API_KEY is';
-    if (!this.config.emailProviderConfigured() && (provider === 'resend' || provider === 'smtp')) {
+  /**
+   * The sender for one provider, from .env credentials. Never falls back to the other provider:
+   * if the selected one is not configured, production sends nothing (emails stay queued).
+   */
+  private createTransport(provider: EmailProvider): MailTransport | null {
+    const { smtp, resendApiKey, replyTo, testRecipient } = this.config.email;
+    const from = this.config.emailFrom(provider);
+    if (!this.config.emailProviderConfigured(provider)) {
       if (this.config.isProduction) {
-        this.logger.error(`${credentials} not set; emails stay queued and are not sent`);
+        this.logger.error(`${notConfiguredMessage(provider)} Emails stay queued and are not sent.`);
         return null;
       }
-      this.logger.warn(`${credentials} not set; emails are printed to the log instead of sent`);
+      this.logger.warn(`${notConfiguredMessage(provider)} Emails are printed to the log instead of sent.`);
       return new ConsoleTransport();
     }
     if (this.config.isProduction && process.env.EMAIL_TEST_RECIPIENT) {
       this.logger.warn('EMAIL_TEST_RECIPIENT is set but ignored in production; emails go to real recipients');
     }
-    const problems = this.config.emailConfigProblems();
+    const problems = this.config.emailConfigProblems(provider);
     if (problems.length > 0) {
       this.logger.error(`Email sending disabled, fix .env: ${problems.join('; ')}`);
       return null;
@@ -76,13 +86,43 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
     return this.transport?.name ?? 'disabled';
   }
 
-  onApplicationBootstrap() {
-    if (!this.config.email.workerEnabled || !this.transport) return;
-    // SMTP: check the login now (a wrong app password shows up here, not at the first email).
-    this.transport.verify?.().then(
-      () => this.logger.log(`Email provider login OK (${this.transport!.name})`),
-      (error: unknown) => this.logger.error(`Email provider login failed (${this.transport!.name}): ${error instanceof Error ? error.message : String(error)}`),
+  /** The provider the worker is currently sending with. */
+  get provider(): EmailProvider {
+    return this.activeProvider;
+  }
+
+  /**
+   * Applies the active provider (admin choice, else .env) if it changed. Only the sender
+   * changes: queued rows, send-once keys and retries are untouched, so nothing is sent twice.
+   */
+  async refreshProvider(): Promise<void> {
+    const { provider } = await this.providers.active();
+    if (provider === this.activeProvider) return;
+    this.logger.log(`Email provider switched to ${providerLabel(provider)}`);
+    this.activeProvider = provider;
+    this.transport = this.createTransport(provider);
+    this.pausedUntil = 0; // a pause (quota, bad login) belonged to the previous provider
+    if (this.config.email.workerEnabled) this.verifyLogin();
+  }
+
+  /** SMTP: check the login now (a wrong password shows up here, not at the first email). */
+  private verifyLogin() {
+    const transport = this.transport;
+    transport?.verify?.().then(
+      () => this.logger.log(`Email provider login OK (${transport.name})`),
+      (error: unknown) => this.logger.error(`Email provider login failed (${transport.name}): ${error instanceof Error ? error.message : String(error)}`),
     );
+  }
+
+  async onApplicationBootstrap() {
+    if (!this.config.email.workerEnabled) return;
+    try {
+      await this.refreshProvider();
+    } catch (error) {
+      this.logger.error(`Could not read the email provider setting; using EMAIL_PROVIDER: ${String(error)}`);
+    }
+    this.verifyLogin();
+    // Polls even while sending is disabled, so an admin's provider change takes effect.
     this.schedule(1_000);
   }
 
@@ -93,7 +133,7 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
 
   /** Process the queue now (e.g. right after queueing a login link) instead of waiting for the next poll. */
   kick() {
-    if (!this.config.email.workerEnabled || !this.transport || this.stopped) return;
+    if (!this.config.email.workerEnabled || this.stopped) return;
     if (this.running) {
       this.rerun = true;
       return;
@@ -123,6 +163,7 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
   }
 
   async processBatch(): Promise<number> {
+    await this.refreshProvider();
     if (!this.transport || Date.now() < this.pausedUntil) return 0;
     const { batchSize, sendIntervalMs, dailyCap } = this.config.email;
     const now = new Date();

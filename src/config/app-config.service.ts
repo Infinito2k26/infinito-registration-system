@@ -103,7 +103,7 @@ export class AppConfig {
        * "Name <address>". Resend: on a verified domain, no default on purpose. SMTP: defaults to
        * the SMTP account itself (Gmail sends only as the signed-in address or its aliases).
        */
-      from: this.str('MAIL_FROM') || (provider === 'smtp' && smtp.user ? `Infinito 2K26 <${smtp.user}>` : ''),
+      from: this.emailFrom(provider),
       replyTo: this.str('MAIL_REPLY_TO') || undefined,
       /**
        * Development only: deliver every email to this address instead of the real recipient
@@ -120,18 +120,28 @@ export class AppConfig {
     };
   }
 
-  /** Whether the chosen provider has its credentials; otherwise development prints emails to the log. */
-  emailProviderConfigured(): boolean {
-    const { provider, resendApiKey, smtp } = this.email;
-    return provider === 'smtp' ? Boolean(smtp.host && smtp.user && smtp.pass) : Boolean(resendApiKey);
+  /** Sender for a provider: MAIL_FROM, or for SMTP the SMTP account itself. */
+  emailFrom(provider: string): string {
+    const user = this.str('SMTP_USER');
+    return this.str('MAIL_FROM') || (provider === 'smtp' && user ? `Infinito 2K26 <${user}>` : '');
   }
 
-  /** Human-readable problems with the email settings; empty when sending can start. */
-  emailConfigProblems(): string[] {
-    const { provider, resendApiKey, from, replyTo } = this.email;
+  /**
+   * Whether a provider has its credentials in .env (default: EMAIL_PROVIDER). The active provider
+   * can also be chosen by an admin (EmailProviderService); credentials always come from .env.
+   */
+  emailProviderConfigured(provider: string = this.email.provider): boolean {
+    const { resendApiKey, smtp } = this.email;
+    return provider === 'smtp' ? Boolean(smtp.host && smtp.user && smtp.pass) : provider === 'resend' && Boolean(resendApiKey);
+  }
+
+  /** Human-readable problems with a provider's settings (default: EMAIL_PROVIDER); empty when sending can start. */
+  emailConfigProblems(provider: string = this.email.provider): string[] {
+    const { resendApiKey, replyTo } = this.email;
+    const from = this.emailFrom(provider);
     const problems: string[] = [];
     if (provider !== 'resend' && provider !== 'smtp') return ['EMAIL_PROVIDER must be "resend" or "smtp"'];
-    if (!this.emailProviderConfigured()) return problems;
+    if (!this.emailProviderConfigured(provider)) return problems;
     if (provider === 'resend' && !resendApiKey.startsWith('re_')) problems.push('RESEND_API_KEY should start with "re_"');
     const address = from.match(/<([^<>\s]+@[^<>\s]+)>\s*$/)?.[1] ?? (/^[^<>\s]+@[^<>\s]+$/.test(from) ? from : '');
     if (!address) problems.push('MAIL_FROM must be "Name <address@your-verified-domain>"');
