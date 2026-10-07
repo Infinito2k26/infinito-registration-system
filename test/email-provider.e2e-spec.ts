@@ -1,6 +1,6 @@
 import { EmailStatus, StaffRole } from '@prisma/client';
 import { EmailTemplate } from '../src/emails/email-templates';
-import { ResendTransport, SmtpTransport } from '../src/emails/mail-transport';
+import { PermanentSendError, ResendTransport, SendPausedError, SmtpTransport } from '../src/emails/mail-transport';
 import { Ctx, Staff, flash, getAs, postAs, resetDatabase, staff, startApp, submitRow } from './e2e-helpers';
 
 /**
@@ -137,5 +137,79 @@ describe('Email provider setting (e2e)', () => {
       ['asha@example.com', EmailStatus.SENT, '<smtp-id@example.test>'],
       ['bina@example.com', EmailStatus.SENT, 'resend-id-1'],
     ]);
+  });
+
+  describe('switching after a Resend quota pause', () => {
+    const verifyNew = async (responseId: string, name: string) => {
+      await submitRow(ctx, responseId, { 'Email Address': `${name.toLowerCase()}@example.com`, Name: name, 'College Name': 'NIT Patna', Sports: 'TT' }).expect(200);
+      const reg = await ctx.prisma.registration.findFirstOrThrow({ where: { person: { name } } });
+      await postAs(ctx, admin, `/admin/registrations/${reg.id}/verify`).expect(303);
+    };
+    const rowOf = (email: string) => ctx.prisma.emailOutbox.findFirstOrThrow({ where: { template: EmailTemplate.QrPass, toEmail: email } });
+
+    it('quota pause -> switch to SMTP: the pending email and new ones are sent once; switching back works', async () => {
+      const resendSend = jest
+        .spyOn(ResendTransport.prototype, 'send')
+        .mockRejectedValue(new SendPausedError('daily_quota_exceeded: You have reached your daily email sending quota.', 3_600_000));
+      let smtpIds = 0;
+      // Like a real SMTP server: a distinct Message-ID per email (providerMessageId is unique).
+      const smtpSend = jest.spyOn(SmtpTransport.prototype, 'send').mockImplementation(() => Promise.resolve(`<smtp-${++smtpIds}@example.test>`));
+
+      await choose('resend').expect(303);
+      await verifyNew('r1', 'Asha');
+      expect(await ctx.worker.processBatch()).toBe(0); // Resend: quota -> paused
+      expect(resendSend).toHaveBeenCalledTimes(1);
+      expect(await rowOf('asha@example.com')).toMatchObject({ status: EmailStatus.PENDING, attempts: 0 }); // kept, attempt not used up
+      expect(await ctx.worker.processBatch()).toBe(0); // still paused for Resend
+      expect(resendSend).toHaveBeenCalledTimes(1);
+
+      // Switch to SMTP: the Resend pause no longer blocks anything.
+      await choose('smtp').expect(303);
+      expect(await ctx.worker.processBatch()).toBe(1);
+      expect(smtpSend).toHaveBeenCalledTimes(1);
+      expect(await rowOf('asha@example.com')).toMatchObject({ status: EmailStatus.SENT, providerMessageId: '<smtp-1@example.test>' });
+
+      // A new email queued after the switch is sent via SMTP too.
+      await verifyNew('r2', 'Bina');
+      expect(await ctx.worker.processBatch()).toBe(1);
+      expect(smtpSend).toHaveBeenCalledTimes(2);
+      expect((await rowOf('bina@example.com')).status).toBe(EmailStatus.SENT);
+
+      // Nothing is sent twice.
+      expect(await ctx.worker.processBatch()).toBe(0);
+      expect([smtpSend.mock.calls.length, resendSend.mock.calls.length]).toEqual([2, 1]);
+      expect(smtpSend.mock.calls.map((c) => c[0].to).sort()).toEqual(['asha@example.com', 'bina@example.com']);
+
+      // Back to Resend (quota fine again): new emails go through Resend.
+      resendSend.mockResolvedValue('resend-id-2');
+      await choose('resend').expect(303);
+      await verifyNew('r3', 'Chetan');
+      expect(await ctx.worker.processBatch()).toBe(1);
+      expect((await rowOf('chetan@example.com')).providerMessageId).toBe('resend-id-2');
+      expect(smtpSend).toHaveBeenCalledTimes(2);
+      expect(await ctx.prisma.emailOutbox.count({ where: { template: EmailTemplate.QrPass } })).toBe(3);
+    });
+
+    it('an SMTP failure follows the normal retry rules', async () => {
+      const smtpSend = jest.spyOn(SmtpTransport.prototype, 'send').mockRejectedValueOnce(new Error('smtp ETIMEDOUT: connection timed out'));
+      await choose('smtp').expect(303);
+      await verifyNew('r1', 'Asha');
+      expect(await ctx.worker.processBatch()).toBe(0);
+      const retry = await rowOf('asha@example.com');
+      expect(retry).toMatchObject({ status: EmailStatus.PENDING, attempts: 1, lastError: 'smtp ETIMEDOUT: connection timed out' });
+      expect(retry.sendAt.getTime()).toBeGreaterThan(Date.now()); // backoff: retried later, not now
+      expect(await ctx.worker.processBatch()).toBe(0);
+      expect(smtpSend).toHaveBeenCalledTimes(1);
+
+      // When due again it is sent once; a refused recipient fails only that email.
+      await ctx.prisma.emailOutbox.update({ where: { id: retry.id }, data: { sendAt: new Date() } });
+      smtpSend.mockResolvedValueOnce('<smtp-id@example.test>');
+      expect(await ctx.worker.processBatch()).toBe(1);
+      expect(await rowOf('asha@example.com')).toMatchObject({ status: EmailStatus.SENT, attempts: 2 });
+      smtpSend.mockRejectedValueOnce(new PermanentSendError('smtp 550: 550 5.1.1 mailbox does not exist'));
+      await verifyNew('r2', 'Bina');
+      expect(await ctx.worker.processBatch()).toBe(0);
+      expect(await rowOf('bina@example.com')).toMatchObject({ status: EmailStatus.FAILED, lastError: 'smtp 550: 550 5.1.1 mailbox does not exist' });
+    });
   });
 });
