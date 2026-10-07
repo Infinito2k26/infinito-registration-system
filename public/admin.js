@@ -36,6 +36,17 @@
     refresh();
   }
 
+  // Add participant manually: one submit (the server also ignores a repeat of the same entry).
+  document.querySelectorAll('form[data-manual-participant]').forEach(function (form) {
+    form.addEventListener('submit', function () {
+      var button = form.querySelector('[data-submit-once]');
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Adding…';
+      }
+    });
+  });
+
   document.querySelectorAll('tr[data-href]').forEach(function (row) {
     row.addEventListener('click', function (event) {
       if (event.target.closest('a, button, input, select, textarea, label, form')) return;
