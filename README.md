@@ -628,6 +628,47 @@ How the worker behaves:
 - **Test mode.** `EMAIL_TEST_RECIPIENT` redirects every email to one inbox in development; it is
   ignored in production.
 
+## 34a. Aadhaar participant profiles
+
+**One full Aadhaar = one participant profile = many registrations.** A `ParticipantProfile` groups
+the Person records (one per email) that share a full Aadhaar number, and through them every
+registration, QR token and email. Registrations, QR tokens, emails and gate logs are unchanged.
+
+- **Identity:** an HMAC fingerprint of the 12 digits, keyed from `AADHAAR_ENCRYPTION_KEY` (spaces
+  and hyphens ignored), unique in the database. The number itself stays encrypted on Person.
+  Without the key there are no profiles. Rotating the key changes the fingerprints: re-run the backfill.
+- **Imports (form and manual):** same Aadhaar + new event = new registration in the same profile;
+  same Aadhaar + same event (under another email) = no duplicate registration, the new email is
+  kept on the profile. Race-safe (unique constraint, `INSERT ... ON CONFLICT`, per-profile lock).
+- **Gate: one participant = one IN/OUT status.** Any QR of a profile (and the manual gate)
+  operates the same status: check-in puts ALL the participant's registrations inside together,
+  check-out takes them all out; another QR or event then shows ALREADY ENTERED. Admitted if any
+  of their registrations is verified and they are not blocked. One gate-log row per action;
+  serialised per participant, so simultaneous scans with different QR codes enter once. A
+  participant without Aadhaar is their Person record (one status across their events).
+- **Blocking is per participant:** Block / Unblock on any registration applies to every record of
+  the profile, a record joining a blocked profile is blocked too, and the gate refuses IN/OUT if any
+  record of the profile is blocked, so another email or QR cannot bypass a block. The admin
+  check-out override is unchanged.
+- **QR codes:** issued per Person (email record) on its first verification, as before; a new event
+  for the same email record reuses its QR. "QR codes generated" counts actual tokens.
+- **Participant page:** all emails, registrations, QR codes generated, email status (sent /
+  queued / failed, from EmailOutbox) and email history of the profile.
+- **Admin → Aadhaar duplicates:** search by full number or last 4 (never merged). The only place a
+  registration can be deleted (with confirmation; a deletion record is kept, gate logs and emails
+  stay unlinked, and a form resync does not recreate it).
+
+**Existing data** (after the `20261010090000_participant_profiles` migration): build, then
+
+```
+npm run profiles:backfill            # dry run: report only
+npm run profiles:backfill -- --apply # link existing people to profiles
+```
+
+It only sets `Person.participantProfileId`, never merges records or changes registrations, QR
+tokens, emails, gate logs or activity, prints the counts before and after, and fails if any
+changed. Safe to run again.
+
 ## 35. Google Drive
 
 1. Create a Google Cloud service account and a JSON key.

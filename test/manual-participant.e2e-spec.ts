@@ -169,7 +169,7 @@ describe('Add participant manually (e2e)', () => {
     expect(new Set(both.map((r) => r.headers.location)).size).toBe(1);
     expect(await ctx.prisma.person.count()).toBe(1);
     expect(await ctx.prisma.registration.count()).toBe(1);
-    await add(entry({ submissionId: '99999999-2222-4333-8444-555555555555', name: 'Mira', email: 'mira@example.com', sports: 'Table Tennis, Chess' })).expect(303);
+    await add(entry({ submissionId: '99999999-2222-4333-8444-555555555555', name: 'Mira', email: 'mira@example.com', aadhaarNumber: '4444 5555 6666', sports: 'Table Tennis, Chess' })).expect(303);
     const mira = await ctx.prisma.registration.findMany({ where: { person: { name: 'Mira' } } });
     expect(mira.map((m) => m.eventSlug).sort()).toEqual(['chess', 'table-tennis']);
     expect(new Set(mira.map((m) => m.personId)).size).toBe(1);

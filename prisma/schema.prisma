@@ -82,39 +82,42 @@ enum ActivityType {
 }
 
 model Person {
-  id                String    @id @default(uuid()) @db.Uuid
+  id                   String    @id @default(uuid()) @db.Uuid
   /// Current (resolved) email: stored lowercased and trimmed; one person = one QR across all
   /// events. Optional: a participant without a usable email is still registered, verified and
   /// gets a QR token; emails are queued only once an address exists (see ParticipantsService).
   /// Also unique case-insensitively: index "Person_email_lower_key" on lower(email), created in
   /// migration 20261007090000 (Prisma cannot express expression indexes here).
-  email             String?   @unique
+  email                String?   @unique
   /// "<responseId>#<member position>" for a participant first created WITHOUT an email, so a
   /// resync of that form row finds the same person instead of creating a duplicate.
-  sourceKey         String?   @unique
-  name              String?
-  phone             String?
+  sourceKey            String?   @unique
+  name                 String?
+  phone                String?
   /// College name as last submitted (display); grouping uses collegeId.
-  college           String?
-  collegeId         String?   @db.Uuid
-  rollNumber        String?
+  college              String?
+  collegeId            String?   @db.Uuid
+  rollNumber           String?
   /// Only the last 4 Aadhaar digits are stored; the full number never enters this database.
-  aadhaarLast4      String?
+  aadhaarLast4         String?
   /// Full Aadhaar number, AES-256-GCM encrypted with AADHAAR_ENCRYPTION_KEY ("v1:iv:tag:data").
   /// Decrypted only to render an ADMIN's page; never sent to coordinators/volunteers.
-  aadhaarEncrypted  String?
+  aadhaarEncrypted     String?
   /// Aadhaar card image (Drive file ID). ADMIN only.
-  aadhaarDriveId    String?
+  aadhaarDriveId       String?
+  /// Aadhaar-based participant profile (full Aadhaar identity). Several Person records (e.g.
+  /// different emails) with the same full Aadhaar share one profile; null = no full Aadhaar.
+  participantProfileId String?   @db.Uuid
   /// Gate access block (whole participant, every event). History lives in RegistrationActivity.
-  blockedAt         DateTime?
-  blockedById       String?   @db.Uuid
-  blockReason       String?
+  blockedAt            DateTime?
+  blockedById          String?   @db.Uuid
+  blockReason          String?
   /// Google Drive file IDs. Files stay private; the server proxies them to logged-in volunteers.
-  photoDriveId      String?
-  idDocumentDriveId String?
+  photoDriveId         String?
+  idDocumentDriveId    String?
   /// Random bearer token encoded in the QR URL (/p/<qrToken>). Created on the person's first verified
   /// payment; kept in plain form so passes can be re-sent.
-  qrToken           String?   @unique
+  qrToken              String?   @unique
 
   /// Migration of past participants: token embedded in the pre-filled profile form link.
   profileToken          String?   @unique
@@ -129,20 +132,22 @@ model Person {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  teamMembers     TeamMember[]
-  registrations   Registration[]
-  entryLogs       EntryLog[]
-  emailOutbox     EmailOutbox[]
-  collegeRef      College?           @relation(fields: [collegeId], references: [id], onDelete: SetNull)
-  emailAliases    PersonEmailAlias[]
-  batchesReceived EmailBatch[]
-  blockedBy       StaffUser?         @relation("PersonBlockedBy", fields: [blockedById], references: [id], onDelete: SetNull)
+  teamMembers        TeamMember[]
+  registrations      Registration[]
+  entryLogs          EntryLog[]
+  emailOutbox        EmailOutbox[]
+  collegeRef         College?            @relation(fields: [collegeId], references: [id], onDelete: SetNull)
+  emailAliases       PersonEmailAlias[]
+  participantProfile ParticipantProfile? @relation(fields: [participantProfileId], references: [id], onDelete: SetNull)
+  batchesReceived    EmailBatch[]
+  blockedBy          StaffUser?          @relation("PersonBlockedBy", fields: [blockedById], references: [id], onDelete: SetNull)
 
   @@index([profileCompletedAt])
   @@index([collegeId])
   @@index([blockedAt])
   @@index([phone])
   @@index([rollNumber])
+  @@index([participantProfileId])
 }
 
 /// Colleges as submitted, grouped by a normalised key (lowercase, single spaces).
@@ -316,6 +321,7 @@ model StaffUser {
   emailBatches          EmailBatch[]
   verificationBatches   VerificationBatch[]
   settingsUpdated       SystemSetting[]
+  registrationDeletions RegistrationDeletion[]
   blockedPeople         Person[]               @relation("PersonBlockedBy")
 }
 
@@ -456,4 +462,39 @@ model SystemSetting {
   updatedAt   DateTime @updatedAt
 
   updatedBy StaffUser? @relation(fields: [updatedById], references: [id], onDelete: SetNull)
+}
+
+/// ONE FULL AADHAAR = ONE PARTICIPANT PROFILE (one physical participant). Groups the Person
+/// records (and through them every Registration, QR token and email) that share a full Aadhaar.
+/// The number itself is never stored here in plain text.
+model ParticipantProfile {
+  id                 String   @id @default(uuid()) @db.Uuid
+  /// HMAC-SHA256 of the normalised 12 digits with a key derived from AADHAAR_ENCRYPTION_KEY.
+  /// Deterministic, so equal numbers match; unique, so two profiles can never share a number.
+  aadhaarFingerprint String   @unique
+  aadhaarLast4       String
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  people Person[]
+
+  @@index([aadhaarLast4])
+}
+
+/// Audit record of a registration an admin deleted (Duplicate Aadhaar Check). Its gate logs and
+/// emails are kept (unlinked); a resync of the same form row does not recreate it.
+model RegistrationDeletion {
+  id             String   @id @default(uuid()) @db.Uuid
+  registrationId String   @db.Uuid
+  personId       String   @db.Uuid
+  eventSlug      String
+  responseId     String?
+  deletedById    String?  @db.Uuid
+  /// What was deleted: registration fields, participant name/email, its activity history.
+  snapshot       Json
+  deletedAt      DateTime @default(now())
+
+  deletedBy StaffUser? @relation(fields: [deletedById], references: [id], onDelete: SetNull)
+
+  @@index([responseId, eventSlug, personId])
 }

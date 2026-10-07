@@ -372,38 +372,55 @@ export class ScanController {
         ? html`<a href="/staff/files/${person.id}/id" target="_blank" rel="noopener">View College ID card</a>`
         : html`<span class="muted">No ID document on file</span>`;
 
-    const rows: SafeHtml[] = person.registrations.map((reg) => {
-      const action = (path: 'enter' | 'exit', label: string, cls: string) => html`<form method="post" action="${actionUrl(path)}" class="enter-form">
+    // ONE participant (Aadhaar profile) = ONE IN/OUT status: a single verdict and button for the
+    // participant; the events below are listed without their own IN/OUT.
+    const otherRecordBlocked = person.blockedByOtherRecord;
+    const regs = person.registrations;
+    const verified = regs.filter((r) => r.paymentStatus === PaymentStatus.VERIFIED);
+    const insideSince = regs.map((r) => r.insideSince).filter((d): d is Date => d !== null).sort((a, b) => a.getTime() - b.getTime())[0];
+    const lastOut = regs.map((r) => r.lastCheckOutAt).filter((d): d is Date => d !== null).sort((a, b) => b.getTime() - a.getTime())[0];
+    const lastIn = regs.flatMap((r) => r.entryLogs).sort((a, b) => b.enteredAt.getTime() - a.enteredAt.getTime())[0];
+    // The registration the action is recorded under: the opened one if verified, else a verified one.
+    const actionReg = verified.find((r) => r.id === manualRegistrationId) ?? verified[0] ?? regs.find((r) => r.id === manualRegistrationId) ?? regs[0];
+    const action = (path: 'enter' | 'exit', label: string, cls: string) => html`<form method="post" action="${actionUrl(path)}" class="enter-form">
           ${csrfField(csrf)}
-          <input type="hidden" name="registrationId" value="${reg.id}">
+          <input type="hidden" name="registrationId" value="${actionReg?.id ?? ''}">
           <input type="hidden" name="gate" class="gate-field">
           <button class="${cls} big">${label}</button>
         </form>`;
-      let verdict;
-      if (reg.paymentStatus !== PaymentStatus.VERIFIED) {
-        verdict = html`<div class="verdict verdict-bad"><b>NOT VERIFIED</b> · DO NOT ADMIT · ${paymentBadge(reg.paymentStatus)}</div>`;
-      } else if (person.blockedAt) {
-        // The reason is internal; the gate only learns that access is blocked.
-        verdict = html`<div class="verdict verdict-bad"><b>ACCESS BLOCKED</b><br>Registration access has been blocked. Please contact the coordinator/admin.</div>`;
-      } else if (reg.insideSince) {
-        const last = reg.entryLogs[0];
-        verdict = html`<div class="verdict verdict-warn"><b>ALREADY ENTERED</b> · INSIDE<br>
-          since ${fmtDate(reg.insideSince)}${last?.volunteer ? html` by ${last.volunteer.name || last.volunteer.email}` : null}${last?.gate ? html` at ${last.gate}` : null}</div>
+    let verdict: SafeHtml;
+    if (verified.length === 0) {
+      verdict = html`<div class="verdict verdict-bad"><b>NOT VERIFIED</b> · DO NOT ADMIT${regs[0] ? html` · ${paymentBadge(regs[0].paymentStatus)}` : null}</div>`;
+    } else if (person.blockedAt) {
+      // The reason is internal; the gate only learns that access is blocked.
+      verdict = html`<div class="verdict verdict-bad"><b>ACCESS BLOCKED</b><br>Registration access has been blocked. Please contact the coordinator/admin.</div>`;
+    } else if (insideSince) {
+      verdict = html`<div class="verdict verdict-warn"><b>ALREADY ENTERED</b> · INSIDE<br>
+          since ${fmtDate(insideSince)}${lastIn?.volunteer ? html` by ${lastIn.volunteer.name || lastIn.volunteer.email}` : null}${lastIn?.gate ? html` at ${lastIn.gate}` : null}</div>
           ${action('exit', 'CHECK OUT (OUT)', 'exit')}`;
-      } else {
-        verdict = html`${reg.lastCheckOutAt ? html`<p class="small muted">OUTSIDE · checked out at ${fmtDate(reg.lastCheckOutAt)}</p>` : null}
+    } else {
+      verdict = html`${lastOut ? html`<p class="small muted">OUTSIDE · checked out at ${fmtDate(lastOut)}</p>` : null}
           ${action('enter', 'MARK ENTERED (CHECK IN)', 'enter')}`;
-      }
+    }
+    const gatePanel = regs.length
+      ? html`<section class="card registration highlight">
+          <div class="reg-head"><h2>Gate</h2><span class="muted small">One IN/OUT status for this participant (all ${regs.length} registration${regs.length === 1 ? '' : 's'})</span></div>
+          ${verdict}
+        </section>`
+      : null;
+
+    const rows: SafeHtml[] = regs.map((reg) => {
       const small = (path: string, label: string, cls = '') => html`<form method="post" action="/gate/${reg.id}/${path}" class="inline">
           ${csrfField(csrf)}<button class="small ${cls}">${label}</button></form>`;
       const tools = [
         reg.paymentStatus !== PaymentStatus.VERIFIED && reg.paymentStatus !== PaymentStatus.REJECTED && canVerify ? small('verify', 'Verify', 'primary') : null,
         reg.paymentStatus === PaymentStatus.VERIFIED ? small('send-qr', 'Send QR email') : null,
       ].filter(Boolean);
-      return html`<section class="card registration ${manualRegistrationId === reg.id ? 'highlight' : ''}">
+      const otherRecord = reg.person.id !== person.id ? html`<p class="small muted">Registered with ${reg.person.email ?? 'no email'} · same Aadhaar (same participant)</p>` : null;
+      return html`<section class="card registration ${manualRegistrationId === reg.id ? 'highlight' : ''}">${otherRecord}
         <div class="reg-head"><h2>${this.eventName(reg.eventSlug)}</h2>${reg.team && reg.team.name !== person.name ? html`<span class="muted">Team ${reg.team.name}</span>` : null}</div>
         ${teamProgress(reg.team)}
-        ${verdict}
+        <p>${paymentBadge(reg.paymentStatus)}${reg.paymentStatus !== PaymentStatus.VERIFIED ? html` <span class="muted small">this event is not verified</span>` : null}</p>
         ${tools.length ? html`<div class="actions">${tools}</div>` : null}
         ${manage ? html`<p class="small"><a href="/admin/registrations/${reg.id}">Open full participant page</a></p>` : null}
       </section>`;
@@ -418,6 +435,7 @@ export class ScanController {
         flash: takeFlash(req, res),
         scripts: ['/assets/pass.js'],
         body: html`${manualRegistrationId ? html`<p class="warning small"><b>Manual gate (no QR scanned).</b> Check the photo and college ID before admitting. Actions are recorded under your name as manual.</p>` : null}
+          ${otherRecordBlocked ? html`<p class="warning small"><b>Blocked:</b> this participant (same Aadhaar) is blocked through another of their records. No check-in or check-out with any of their QR codes.</p>` : null}
           <section class="card person">
             ${photo}
             <div>
@@ -428,6 +446,7 @@ export class ScanController {
               <p class="small">${idDoc}</p>
             </div>
           </section>
+          ${gatePanel}
           ${rows.length ? rows : html`<p class="muted">No registrations for this pass.</p>`}
           ${details}
           ${

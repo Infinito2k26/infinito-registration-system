@@ -6,6 +6,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ActivityEntry, recordActivity } from './activity';
 import { encryptAadhaar } from './aadhaar-crypto';
 import { collegeDisplayName, collegeNameKey } from './college';
+import { ParticipantProfileService } from './participant-profile.service';
 import { ParticipantsService, emailOwnedByOther } from './participants.service';
 
 export interface IngestSource {
@@ -58,6 +59,7 @@ export class RegistrationsService {
     private readonly prisma: PrismaService,
     private readonly config: AppConfig,
     private readonly participants: ParticipantsService,
+    private readonly profiles: ParticipantProfileService,
   ) {}
 
   /**
@@ -171,7 +173,8 @@ export class RegistrationsService {
           (await tx.personEmailAlias.findUnique({ where: { email: member.email }, include: { person: true } }))?.person)
         : undefined) ?? (await tx.person.findUnique({ where: { sourceKey } }));
     if (!existing) {
-      return { person: await tx.person.create({ data: { email: member.email, sourceKey: member.email ? undefined : sourceKey, ...profile } }), emailAdded: false };
+      const created = await tx.person.create({ data: { email: member.email, sourceKey: member.email ? undefined : sourceKey, ...profile } });
+      return { person: await this.linkProfile(tx, created, member), emailAdded: false };
     }
     let emailAdded = false;
     if (!existing.email && member.email) {
@@ -181,7 +184,56 @@ export class RegistrationsService {
       emailAdded = (await tx.person.updateMany({ where: { id: existing.id, email: null }, data: { email: member.email } })).count === 1;
     }
     const person = await tx.person.update({ where: { id: existing.id }, data: profile });
-    return { person, emailAdded };
+    return { person: await this.linkProfile(tx, person, member), emailAdded };
+  }
+
+  /**
+   * ONE FULL AADHAAR = ONE PARTICIPANT PROFILE: links the person to the profile of the member's
+   * full Aadhaar (created if missing, race-safe). Different emails with the same Aadhaar stay
+   * separate Person records in the same profile. Without a full Aadhaar nothing changes.
+   */
+  private async linkProfile<T extends { id: string; participantProfileId: string | null }>(tx: Prisma.TransactionClient, person: T, member: ParsedMember): Promise<T> {
+    if (!member.aadhaarFull) return person;
+    const profileId = await this.profiles.ensureProfile(tx, member.aadhaarFull);
+    if (!profileId || person.participantProfileId === profileId) return person;
+    await tx.person.update({ where: { id: person.id }, data: { participantProfileId: profileId } });
+    // A blocked participant stays blocked: a record joining a blocked profile takes its block.
+    const blocked = await tx.person.findFirst({
+      where: { participantProfileId: profileId, id: { not: person.id }, blockedAt: { not: null } },
+      select: { blockedAt: true, blockedById: true, blockReason: true },
+    });
+    if (blocked) await tx.person.updateMany({ where: { id: person.id, blockedAt: null }, data: blocked });
+    return { ...person, participantProfileId: profileId };
+  }
+
+  /**
+   * Why a NEW registration for this person and event must not be created, or null:
+   * - an admin deleted it (Duplicate Aadhaar Check): a resync of the form row does not bring it back;
+   * - the same full Aadhaar (same profile) is already registered for this event under another
+   *   email: duplicate registration (the new email stays on the profile).
+   * Serialised per profile, so two rows arriving together cannot both register.
+   */
+  private async skipNewRegistration(
+    tx: Prisma.TransactionClient,
+    source: IngestSource,
+    member: ParsedMember,
+    person: { id: string; participantProfileId: string | null },
+  ): Promise<string | null> {
+    const eventName = this.config.eventName(source.eventSlug);
+    const who = `Member ${member.position} (${member.email ?? member.name})`;
+    const deleted = await tx.registrationDeletion.findFirst({
+      where: { responseId: source.responseId, eventSlug: source.eventSlug, personId: person.id },
+      select: { id: true },
+    });
+    if (deleted) return `${who}: the ${eventName} registration was deleted by an admin; not recreated`;
+    if (!person.participantProfileId) return null;
+    await this.profiles.lock(tx, person.participantProfileId);
+    const other = await tx.registration.findFirst({
+      where: { eventSlug: source.eventSlug, personId: { not: person.id }, person: { participantProfileId: person.participantProfileId } },
+      select: { person: { select: { name: true, email: true } } },
+    });
+    if (!other) return null;
+    return `${who}: the same Aadhaar is already registered for ${eventName} (${other.person.email ?? other.person.name ?? 'another record'}); duplicate registration not created`;
   }
 
   private async ingestInTx(
@@ -274,6 +326,14 @@ export class RegistrationsService {
 
     const activity: ActivityEntry[] = [];
     for (const { member, person } of people) {
+      const reg = existingRegs.get(person.id);
+      if (!reg) {
+        const skip = await this.skipNewRegistration(tx, source, member, person);
+        if (skip) {
+          warnings.push(skip);
+          continue;
+        }
+      }
       const role = member.isCaptain ? 'CAPTAIN' : 'MEMBER';
       await tx.teamMember.upsert({
         where: { teamId_personId: { teamId: team.id, personId: person.id } },
@@ -281,7 +341,6 @@ export class RegistrationsService {
         update: { role },
       });
 
-      const reg = existingRegs.get(person.id);
       if (!reg) {
         const created = await tx.registration.create({
           data: { eventSlug, personId: person.id, teamId: team.id, transactionId, ...sourceFields },
