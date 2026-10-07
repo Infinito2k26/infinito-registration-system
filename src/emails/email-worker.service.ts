@@ -19,6 +19,9 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** "p***@example.com" for logs. */
+const maskEmail = (email: string) => email.replace(/^(.)[^@]*(@.*)$/, '$1***$2');
+
 /**
  * Polls EmailOutbox and sends due emails one at a time, throttled to stay under
  * the provider's rate limit. Rows are claimed with a conditional update, so
@@ -101,8 +104,13 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
     this.logger.log(`Email provider switched to ${providerLabel(provider)}`);
     this.activeProvider = provider;
     this.transport = this.createTransport(provider);
-    this.pausedUntil = 0; // a pause (quota, bad login) belonged to the previous provider
-    if (this.config.email.workerEnabled) this.verifyLogin();
+    // A pause (quota, bad login) belonged to the previous provider. The next run may also have
+    // been scheduled far ahead for that pause (e.g. 1 hour for a daily quota): run again now.
+    this.pausedUntil = 0;
+    if (this.config.email.workerEnabled) {
+      this.verifyLogin();
+      this.kick();
+    }
   }
 
   /** SMTP: check the login now (a wrong password shows up here, not at the first email). */
@@ -197,6 +205,7 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
         data: { status: EmailStatus.PROCESSING, attempts: { increment: 1 } },
       });
       if (claimed.count === 0) continue; // cancelled or taken by another instance
+      this.logger.log(`Picking email outbox ${row.id} (${row.template}, attempt ${row.attempts + 1})`);
       if (await this.sendOne({ ...row, attempts: row.attempts + 1 })) sent++;
       await sleep(sendIntervalMs);
     }
@@ -217,12 +226,16 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
   }
 
   private async sendOne(row: EmailOutbox): Promise<boolean> {
+    const transport = this.transport!;
     try {
-      const providerMessageId = await this.transport!.send(await this.buildEmail(row));
+      const email = await this.buildEmail(row);
+      this.logger.log(`Sending email ${row.id} via ${transport.name} to ${maskEmail(email.to)}`);
+      const providerMessageId = await transport.send(email);
       await this.prisma.emailOutbox.update({
         where: { id: row.id },
         data: { status: EmailStatus.SENT, sentAt: new Date(), providerMessageId, lastError: null },
       });
+      this.logger.log(`Email sent successfully ${row.id} (${transport.name})`);
       return true;
     } catch (error) {
       const message = (error instanceof Error ? error.message : String(error)).slice(0, 1000);
@@ -233,7 +246,7 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
           where: { id: row.id },
           data: { status: EmailStatus.PENDING, attempts: { decrement: 1 }, lastError: message },
         });
-        this.logger.warn(`Email sending paused ${Math.round(error.pauseMs / 1000)}s: ${message}`);
+        this.logger.warn(`Email sending paused ${Math.round(error.pauseMs / 1000)}s (${transport.name}): ${message}`);
         return false;
       }
 
@@ -247,7 +260,8 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
           : { status: EmailStatus.PENDING, sendAt: retryAt, lastError: message },
       });
       this.logger.warn(
-        `Email ${row.idempotencyKey} to ${row.toEmail} ${giveUp ? 'failed permanently' : 'will retry'} (attempt ${row.attempts}): ${message}`,
+        `Email send failed ${row.id} (${transport.name}, ${row.idempotencyKey} to ${maskEmail(row.toEmail)}), ` +
+          `${giveUp ? 'failed permanently' : `will retry at ${retryAt.toISOString()}`} (attempt ${row.attempts}): ${message}`,
       );
       return false;
     }

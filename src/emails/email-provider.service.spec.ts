@@ -3,6 +3,7 @@ import { AppConfig } from '../config/app-config.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { EMAIL_PROVIDER_SETTING, EmailProviderError, EmailProviderService } from './email-provider.service';
 import { EmailWorkerService } from './email-worker.service';
+import { SmtpTransport } from './mail-transport';
 
 const smtpOnly = {
   EMAIL_PROVIDER: 'smtp',
@@ -83,5 +84,42 @@ describe('EmailWorkerService provider selection', () => {
     await providers.set('resend', 'admin-id');
     await worker.refreshProvider();
     expect(worker.transportName).toBe('resend');
+  });
+});
+
+describe('EmailWorkerService after a provider switch (scheduling)', () => {
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  it('a Resend quota pause (next run 1 hour away) does not delay SMTP: switching runs the queue now', async () => {
+    jest.useFakeTimers();
+    const config = new AppConfig(
+      new ConfigService({
+        NODE_ENV: 'production', APP_SECRET: 'a'.repeat(64), FORMS_WEBHOOK_SECRET: 'b'.repeat(32), APP_BASE_URL: 'https://x.test',
+        ...smtpOnly, EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_live_key', EMAIL_WORKER_ENABLED: 'true',
+      }),
+    );
+    jest.spyOn(SmtpTransport.prototype, 'verify').mockResolvedValue(undefined); // no network
+    const prisma = fakePrisma();
+    const providers = new EmailProviderService(prisma as unknown as PrismaService, config);
+    const worker = new EmailWorkerService(prisma as unknown as PrismaService, config, providers);
+    const internals = worker as unknown as { pausedUntil: number; schedule(ms: number): void; processBatch(): Promise<number> };
+    const runs = jest.spyOn(internals, 'processBatch').mockResolvedValue(0);
+
+    // State after Resend answered daily_quota_exceeded: paused, next run in an hour.
+    internals.pausedUntil = Date.now() + 3_600_000;
+    internals.schedule(3_600_000);
+    await jest.advanceTimersByTimeAsync(60_000);
+    expect(runs).not.toHaveBeenCalled();
+
+    await providers.set('smtp', 'admin-id');
+    await worker.refreshProvider();
+    expect(internals.pausedUntil).toBe(0); // the Resend pause no longer applies
+    await jest.advanceTimersByTimeAsync(10);
+    expect(runs).toHaveBeenCalledTimes(1); // ran right away, not at the end of the Resend pause
+    expect(worker.transportName).toBe('smtp');
+    worker.onModuleDestroy();
   });
 });
