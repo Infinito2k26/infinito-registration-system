@@ -53,7 +53,7 @@ const personSelect = {
 } as const;
 
 /**
- * ADMIN Duplicate Aadhaar Check, by search only (nothing is listed until an admin searches).
+ * ADMIN Duplicate Aadhaar Check: a default list of participants with duplicate records, plus search.
  * Identity = the FULL Aadhaar: a 12-digit search finds the one ParticipantProfile of that number
  * (by its fingerprint); a last-4 search lists every possible profile separately and never merges
  * different numbers. Records not linked to a profile yet are found by decrypting in memory.
@@ -83,14 +83,68 @@ export class AadhaarDuplicatesService {
         // Not linked yet (before the backfill): same number, read in memory.
         ...(await this.unlinked(digits.slice(-4))).filter((p) => this.digitsOf(p) === digits),
       ];
-      return { kind: 'full', last4: digits.slice(-4), groups: this.group(people) };
+      return { kind: 'full', last4: digits.slice(-4), groups: this.group(await this.attachToProfiles(people)) };
     }
     const profiles = await this.prisma.participantProfile.findMany({ where: { aadhaarLast4: digits }, select: { id: true } });
     const people = [
       ...(await this.prisma.person.findMany({ where: { participantProfileId: { in: profiles.map((p) => p.id) } }, select: personSelect })),
       ...(await this.unlinked(digits)),
     ];
-    return { kind: 'last4', last4: digits, groups: this.group(people) };
+    return { kind: 'last4', last4: digits, groups: this.group(await this.attachToProfiles(people)) };
+  }
+
+  /**
+   * Records not linked to a profile yet (before the backfill) whose full number already has a
+   * profile are shown inside that profile: the same participant, matched by the fingerprint.
+   */
+  private async attachToProfiles<T extends { participantProfileId: string | null; aadhaarEncrypted: string | null }>(people: T[]): Promise<T[]> {
+    const key = this.config.aadhaarKey;
+    if (!key) return people;
+    const fps = new Map<T, string>();
+    for (const p of people) {
+      const digits = p.participantProfileId ? null : this.digitsOf(p);
+      const fp = digits ? aadhaarFingerprint(digits, key) : null;
+      if (fp) fps.set(p, fp);
+    }
+    if (fps.size === 0) return people;
+    const profiles = await this.prisma.participantProfile.findMany({ where: { aadhaarFingerprint: { in: [...new Set(fps.values())] } }, select: { id: true, aadhaarFingerprint: true } });
+    const byFp = new Map(profiles.map((pr) => [pr.aadhaarFingerprint, pr.id]));
+    return people.map((p) => {
+      const profileId = fps.has(p) ? byFp.get(fps.get(p)!) : undefined;
+      return profileId ? { ...p, participantProfileId: profileId } : p;
+    });
+  }
+
+  /**
+   * Default list: every participant with duplicate Aadhaar-related records, i.e. a profile with
+   * 2+ Person records (the same full Aadhaar under several emails) or the same event registered
+   * more than once. Records not linked to a profile yet are grouped by their decrypted full
+   * number. Grouping is always by the full number; the last 4 digits never merge participants.
+   */
+  async duplicates(): Promise<AadhaarGroup[]> {
+    const [multiRecord, multiEvent] = await Promise.all([
+      this.prisma.person.groupBy({ by: ['participantProfileId'], where: { participantProfileId: { not: null } }, _count: { _all: true }, having: { participantProfileId: { _count: { gt: 1 } } } }),
+      this.prisma.$queryRaw<{ id: string }[]>`
+        SELECT DISTINCT p."participantProfileId" AS id
+        FROM "Registration" r JOIN "Person" p ON p."id" = r."personId"
+        WHERE p."participantProfileId" IS NOT NULL
+        GROUP BY p."participantProfileId", r."eventSlug"
+        HAVING COUNT(*) > 1`,
+    ]);
+    // Not linked yet (before the profile backfill): read the full number in memory; a record whose
+    // number has a profile joins it, the others are grouped by number.
+    const unlinked = this.config.aadhaarKey
+      ? await this.attachToProfiles(await this.prisma.person.findMany({ where: { participantProfileId: null, aadhaarEncrypted: { not: null } }, select: personSelect }))
+      : [];
+    const profileIds = [
+      ...new Set([...multiRecord.map((g) => g.participantProfileId!), ...multiEvent.map((r) => r.id), ...unlinked.flatMap((p) => (p.participantProfileId ? [p.participantProfileId] : []))]),
+    ];
+    const linked = profileIds.length ? await this.prisma.person.findMany({ where: { participantProfileId: { in: profileIds } }, select: personSelect }) : [];
+    const loose = unlinked.filter((p) => !p.participantProfileId);
+    const attached = unlinked.filter((p) => p.participantProfileId);
+    return this.group([...linked, ...attached, ...loose])
+      .filter((g) => g.participants > 1 || g.duplicateEvents.length > 0)
+      .sort((a, b) => b.participants - a.participants || b.registrations.length - a.registrations.length || a.last4.localeCompare(b.last4));
   }
 
   private unlinked(last4: string) {

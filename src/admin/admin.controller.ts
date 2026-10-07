@@ -505,12 +505,13 @@ export class AdminController {
 
   // ---------- Aadhaar duplicate check (ADMIN only) ----------
 
-  /** Search first: nothing is listed until an admin searches. */
+  /** Lists every participant with duplicate Aadhaar records; the search box narrows it down. */
   @Get('aadhaar-duplicates')
   @Roles(StaffRole.ADMIN)
-  aadhaarDuplicateReport(@Req() req: StaffRequest, @Res() res: Response) {
+  async aadhaarDuplicateReport(@Req() req: StaffRequest, @Res() res: Response) {
     res.set('Cache-Control', 'no-store');
-    this.render(req, res, 'Aadhaar duplicates', 'aadhaar', aadhaarDuplicatesPage({ canCompare: this.aadhaarDuplicates.canCompare, csrf: this.auth.csrfToken(req.staff!.sessionId), eventName: this.eventName }));
+    const duplicates = await this.aadhaarDuplicates.duplicates();
+    this.render(req, res, 'Aadhaar duplicates', 'aadhaar', aadhaarDuplicatesPage({ canCompare: this.aadhaarDuplicates.canCompare, csrf: this.auth.csrfToken(req.staff!.sessionId), eventName: this.eventName, duplicates }));
   }
 
   /** Search by full number or last 4 digits. POST, so the number never appears in URLs or access logs. */
