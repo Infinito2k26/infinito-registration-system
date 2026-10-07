@@ -125,6 +125,8 @@ export function registrationsPage(args: {
   eventName: EventName;
   /** Set for ADMINs only: enables "Verify Selected" on the Pending view. */
   bulkVerifyCsrf?: string;
+  /** ADMINs only: the "+ Add Participant Manually" button. */
+  canAddManually?: boolean;
 }): SafeHtml {
   const { filters, list, events, eventName } = args;
   const bulk = args.bulkVerifyCsrf && filters.view === 'PENDING' ? args.bulkVerifyCsrf : null;
@@ -160,6 +162,7 @@ export function registrationsPage(args: {
     ${eventSidebar(events, filters.event, eventName, '/admin/registrations', { college: filters.college })}
     <div class="content">
       <h1>${filters.event ? eventName(filters.event) : 'All registrations'}${filters.view ? html` <span class="muted">· ${VIEW_LABEL[filters.view]}</span>` : null}</h1>
+      ${args.canAddManually ? html`<p><a class="button" href="/admin/registrations/new">+ Add Participant Manually</a></p>` : null}
       ${args.collegeName ? html`<p>College: <b>${args.collegeName}</b> · <a href="/admin/registrations${buildQuery({ event: filters.event })}">all colleges</a> · <a href="/admin/colleges/${filters.college}${buildQuery({ event: filters.event })}">college page</a></p>` : null}
       ${countersBar(c, { href, active: filters.view })}
       <form method="get" action="/admin/registrations" class="row-form search">
@@ -267,6 +270,7 @@ function activityText(a: { type: ActivityType; details: unknown }): SafeHtml {
   const str = (v: unknown) => (v === undefined || v === null ? '' : String(v));
   switch (a.type) {
     case ActivityType.SUBMITTED:
+      if (d.manual) return html`<b>Added manually</b> by an admin${d.expectedArrival ? ` · expected arrival ${str(d.expectedArrival)}` : ''}${d.expectedDeparture ? ` · expected departure ${str(d.expectedDeparture)}` : ''}`;
       return html`Imported from the form${d.sourceRow ? ` (sheet row ${str(d.sourceRow)})` : ''}${d.expectedArrival ? ` · expected arrival ${str(d.expectedArrival)}` : ''}${d.expectedDeparture ? ` · expected departure ${str(d.expectedDeparture)}` : ''}`;
     case ActivityType.UPDATED:
       return html`Form response re-synced${d.movedFromTeamId ? ' · moved from another response' : ''}${d.transactionId !== undefined ? ` · txn now ${str(d.transactionId)}` : ''}${d.paymentResetFromRejected ? ' · back to pending' : ''}${d.expectedArrival !== undefined ? ` · expected arrival now ${str(d.expectedArrival)}` : ''}${d.expectedDeparture !== undefined ? ` · expected departure now ${str(d.expectedDeparture)}` : ''}`;
@@ -1097,4 +1101,47 @@ export function verificationBatchPage(args: { batch: VerificationBatchDetail; ev
       </tbody>
     </table>
     </div>`;
+}
+
+/**
+ * ADMIN "Add Participant Manually": the Google Form's questions for one individual participant.
+ * The entry goes through the normal import, so it behaves exactly like a form registration.
+ */
+export function manualParticipantPage(args: {
+  submissionId: string;
+  values: Record<string, string>;
+  errors: string[];
+  events: EventSummary;
+  eventName: EventName;
+  csrf: string;
+}): SafeHtml {
+  const v = args.values;
+  const field = (name: string, label: string, attrs: SafeHtml | null = null, hint?: string) =>
+    html`<label>${label} <input name="${name}" value="${v[name] ?? ''}" ${attrs}>${hint ? html`<span class="muted small">${hint}</span>` : null}</label>`;
+  return html`<p class="small"><a href="/admin/registrations?status=pending">← Pending registrations</a></p>
+    <h1>Add participant manually</h1>
+    <p class="muted">For someone who did not register through the Google Form. One individual participant per entry (for a team, add each member). The participant starts as <b>Pending</b> and then follows the normal Verify / Reject / QR pass flow. No email is sent now; the QR pass email goes out on verification if an email is given.</p>
+    ${args.errors.length ? html`<div class="warning"><b>Not saved:</b><ul>${args.errors.map((e) => html`<li>${e}</li>`)}</ul></div>` : null}
+    <section class="card narrow">
+      <form method="post" action="/admin/registrations/new" class="stack" data-manual-participant>
+        ${csrfField(args.csrf)}
+        <input type="hidden" name="submissionId" value="${args.submissionId}">
+        ${field('name', 'Name *', html`required maxlength="120"`)}
+        ${field('email', 'Email (optional)', html`type="email" maxlength="200"`)}
+        ${field('phone', 'Mobile No.', html`type="tel" maxlength="20"`)}
+        ${field('college', 'College Name', html`maxlength="200"`)}
+        ${field('rollNumber', 'College Roll No.', html`maxlength="60"`)}
+        ${field('idCardLink', 'College ID Card Photo (Google Drive link, optional)', html`maxlength="500"`, 'Shared with the app\'s Drive service account, like form uploads.')}
+        ${field('aadhaarNumber', 'Aadhaar No.', html`inputmode="numeric" maxlength="14" autocomplete="off"`, 'Stored like form entries: last 4 digits, full number encrypted (admin only).')}
+        ${field('aadhaarCardLink', 'Aadhaar Card Photo (Google Drive link, optional)', html`maxlength="500"`)}
+        ${field('sports', 'Sports / event *', html`required maxlength="200" list="manual-sports"`, 'Same as the form\'s Sports answer; several sports separated by commas.')}
+        <datalist id="manual-sports">${args.events.map((e) => html`<option value="${args.eventName(e.slug)}"></option>`)}</datalist>
+        ${field('checkIn', 'Check In Date', html`type="date"`)}
+        ${field('checkOut', 'Check Out Date', html`type="date"`)}
+        ${field('accommodation', 'Accommodation', html`maxlength="200"`)}
+        ${field('accommodationPeriod', 'Accommodation Period', html`maxlength="200"`)}
+        <label>Remark <textarea name="remark" maxlength="500" rows="3">${v.remark ?? ''}</textarea></label>
+        <button class="primary" data-submit-once>Add participant</button>
+      </form>
+    </section>`;
 }

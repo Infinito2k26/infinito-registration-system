@@ -13,6 +13,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { StaffRole } from '@prisma/client';
+import { randomUUID } from 'crypto';
 import { Response } from 'express';
 import { AuthService } from '../auth/auth.service';
 import { MANAGE_ROLES, Roles, StaffRequest } from '../auth/auth.types';
@@ -32,6 +33,7 @@ import { NavSection, page } from '../web/layout';
 import { WebExceptionFilter } from '../web/web-exception.filter';
 import { dateOnly } from '../forms/form-response.parser';
 import { decryptAadhaar } from '../registrations/aadhaar-crypto';
+import { ManualRegistrationError, ManualRegistrationService, sanitize } from '../registrations/manual-registration.service';
 import { AdminQueryService, ExpectedKind, REGISTRATION_VIEWS, RegistrationView } from './admin-query.service';
 import {
   collegePage,
@@ -41,6 +43,7 @@ import {
   participantPage,
   registrationsPage,
   teamPage,
+  manualParticipantPage,
   verificationBatchPage,
   verificationReportPage,
 } from './admin.views';
@@ -88,6 +91,7 @@ export class AdminController {
     private readonly queries: AdminQueryService,
     private readonly payments: PaymentsService,
     private readonly bulkVerification: BulkVerificationService,
+    private readonly manualRegistrations: ManualRegistrationService,
     private readonly qrEmails: QrEmailService,
     private readonly collegeEmails: CollegeEmailService,
     private readonly participants: ParticipantsService,
@@ -168,10 +172,40 @@ export class AdminController {
         events,
         collegeName: collegeRow ?? undefined,
         eventName: this.eventName,
-        // Bulk verify: admins only (the POST route checks the role again).
+        // Bulk verify and Add Participant Manually: admins only (their routes check the role again).
         bulkVerifyCsrf: req.staff!.role === StaffRole.ADMIN ? this.auth.csrfToken(req.staff!.sessionId) : undefined,
+        canAddManually: req.staff!.role === StaffRole.ADMIN,
       }),
     );
+  }
+
+  // ---------- add participant manually (ADMIN only; declared before registrations/:id) ----------
+
+  @Get('registrations/new')
+  @Roles(StaffRole.ADMIN)
+  async newParticipant(@Req() req: StaffRequest, @Res() res: Response) {
+    const events = await this.queries.eventSummary();
+    this.render(req, res, 'Add participant', 'registrations', manualParticipantPage({ submissionId: randomUUID(), values: sanitize({}), errors: [], events, eventName: this.eventName, csrf: this.auth.csrfToken(req.staff!.sessionId) }));
+  }
+
+  /**
+   * Creates the participant through the normal import (see ManualRegistrationService): PENDING,
+   * then the usual Verify / Reject / QR flow. The submission ID makes a double submit harmless.
+   */
+  @Post('registrations/new')
+  @Roles(StaffRole.ADMIN)
+  async createParticipant(@Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
+    const submissionId = typeof body.submissionId === 'string' && UUID.test(body.submissionId) ? body.submissionId : randomUUID();
+    try {
+      const { registrationIds, warnings } = await this.manualRegistrations.create(body, submissionId, req.staff!.id);
+      const text = `Participant added (pending verification)${registrationIds.length > 1 ? `, ${registrationIds.length} events` : ''}${warnings.length ? `. Note: ${warnings.join('; ')}` : ''}`;
+      this.flashAndBack(res, { type: 'ok', text }, `/admin/registrations/${registrationIds[0]}`);
+    } catch (error) {
+      if (!(error instanceof ManualRegistrationError)) throw error;
+      const events = await this.queries.eventSummary();
+      res.status(422);
+      this.render(req, res, 'Add participant', 'registrations', manualParticipantPage({ submissionId, values: sanitize(body), errors: error.errors, events, eventName: this.eventName, csrf: this.auth.csrfToken(req.staff!.sessionId) }));
+    }
   }
 
   @Get('registrations/:id')

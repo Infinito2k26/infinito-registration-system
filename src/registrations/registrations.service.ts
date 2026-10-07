@@ -15,6 +15,8 @@ export interface IngestSource {
   sourceRow?: number;
   /** Stable per response row; re-ingesting the same responseId updates instead of duplicating. */
   responseId: string;
+  /** Admin who added the participant manually (no form row); recorded on the SUBMITTED activity. */
+  addedById?: string;
 }
 
 /** One form row; it may register for several events (comma-separated Sports answer). */
@@ -287,7 +289,9 @@ export class RegistrationsService {
         activity.push({
           registrationId: created.id,
           type: ActivityType.SUBMITTED,
+          actorId: source.addedById,
           details: {
+            manual: source.addedById ? true : undefined,
             responseId,
             sourceRow: source.sourceRow ?? null,
             transactionId: transactionId ?? null,
