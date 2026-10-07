@@ -1193,11 +1193,13 @@ export function aadhaarDuplicatesPage(args: {
   eventName: EventName;
   search?: Awaited<ReturnType<AadhaarDuplicatesService['search']>>;
   searchError?: string;
+  /** Default list (no search): participants with duplicate Aadhaar records. */
+  duplicates?: AadhaarGroup[];
 }): SafeHtml {
-  const { search, eventName } = args;
+  const { search, eventName, duplicates } = args;
   const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
   return html`<h1>Aadhaar duplicates</h1>
-    <p class="muted">Search a participant by Aadhaar. One full Aadhaar number = one participant profile, whatever the emails; the last 4 digits alone never identify a participant. Report only: nothing is rejected automatically.</p>
+    <p class="muted">One full Aadhaar number = one participant profile, whatever the emails; the last 4 digits alone never identify a participant. Listed: participants whose Aadhaar is on several records (emails), or who registered for the same event more than once. Report only: nothing is rejected automatically.</p>
     ${args.canCompare ? null : html`<div class="warning">AADHAAR_ENCRYPTION_KEY is not configured, so full numbers cannot be compared. Only the last-4 search works.</div>`}
     <section class="card">
       <h2>Search Aadhaar / last 4 digits</h2>
@@ -1214,6 +1216,13 @@ export function aadhaarDuplicatesPage(args: {
           ? html`<p>No registrations with ${search.kind === 'full' ? 'this Aadhaar number' : html`an Aadhaar number ending <span class="mono">${search.last4}</span>`}.</p>`
           : html`<p>${search.kind === 'full' ? 'This Aadhaar number' : html`Aadhaar numbers ending <span class="mono">${search.last4}</span>`}: ${search.groups.reduce((n, g) => n + g.registrations.length, 0)} registration(s)${search.kind === 'last4' && search.groups.length > 1 ? html` across ${search.groups.length} different participants (A, B, …); the last 4 digits alone do not identify a participant` : null}.</p>
             ${search.groups.map((g, i) => aadhaarGroupCard(g, eventName, search.kind === 'last4' && search.groups.length > 1 ? `participant ${letters[i] ?? i + 1}` : undefined))}`
+        : null
+    }
+    ${search || args.searchError ? html`<p class="small"><a href="/admin/aadhaar-duplicates">← Show all duplicates</a></p>` : null}
+    ${
+      duplicates
+        ? html`<h2>Participants with duplicate Aadhaar records (${duplicates.length})</h2>
+            ${duplicates.length ? duplicates.map((g) => aadhaarGroupCard(g, eventName)) : html`<p class="muted">No duplicate Aadhaar records.</p>`}`
         : null
     }`;
 }

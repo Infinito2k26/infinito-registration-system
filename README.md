@@ -654,8 +654,10 @@ registration, QR token and email. Registrations, QR tokens, emails and gate logs
   for the same email record reuses its QR. "QR codes generated" counts actual tokens.
 - **Participant page:** all emails, registrations, QR codes generated, email status (sent /
   queued / failed, from EmailOutbox) and email history of the profile.
-- **Admin → Aadhaar duplicates:** search by full number or last 4 (never merged). The only place a
-  registration can be deleted (with confirmation; a deletion record is kept, gate logs and emails
+- **Admin → Aadhaar duplicates:** lists every participant with duplicate Aadhaar records (one
+  full Aadhaar on several email records, or the same event registered twice; records not linked
+  to a profile yet are matched by their full number), plus a search by full number or last 4 that
+  narrows the list (last 4 never merges participants). The only place a registration can be deleted (with confirmation; a deletion record is kept, gate logs and emails
   stay unlinked, and a form resync does not recreate it).
 
 **Existing data** (after the `20261010090000_participant_profiles` migration): build, then

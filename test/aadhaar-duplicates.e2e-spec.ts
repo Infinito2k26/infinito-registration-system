@@ -2,7 +2,7 @@ import { StaffRole } from '@prisma/client';
 import { Ctx, Staff, flash, getAs, postAs, resetDatabase, staff, startApp, submitRow } from './e2e-helpers';
 
 /**
- * ADMIN Duplicate Aadhaar Check (ParticipantProfile based): search first, full Aadhaar identity,
+ * ADMIN Duplicate Aadhaar Check (ParticipantProfile based): default duplicate list plus search, full Aadhaar identity,
  * last 4 never merged, and the only place a registration can be deleted.
  */
 describe('Duplicate Aadhaar Check (e2e)', () => {
@@ -49,11 +49,34 @@ describe('Duplicate Aadhaar Check (e2e)', () => {
     expect((await getAs(ctx, coordinator, '/admin/registrations').expect(200)).text).not.toContain('Aadhaar duplicates');
   });
 
-  it('24-26. search first; a full number finds its one profile (any format); last 4 never merges different numbers', async () => {
+  it('the page lists every participant with duplicate records by default, never merging by last 4', async () => {
     await seed();
     const start = (await getAs(ctx, admin, '/admin/aadhaar-duplicates').expect(200)).text;
-    expect(start).toContain('Search Aadhaar / last 4 digits');
-    expect(headings(start)).toEqual([]); // nothing listed before a search
+    expect(start).toContain('Search Aadhaar / last 4 digits'); // the search box stays
+    expect(start).toContain('Participants with duplicate Aadhaar records (1)');
+    expect(headings(start)).toEqual([['9012', 2]]); // Rahul: one Aadhaar on two email records
+    expect(start).toContain('rahul.alt@example.com');
+    // Amit shares the last 4 digits but not the number: not merged, and not a duplicate himself.
+    for (const hidden of ['Amit', 'Sita', '1234 5678 9012']) expect([hidden, start.includes(hidden)]).toEqual([hidden, false]);
+    expect(start).toContain('/delete'); // delete links live here
+  });
+
+  it('also lists the same event registered twice, and records not linked to a profile yet', async () => {
+    await row('r1', 'kiran@example.com', 'Chess', '4444 5555 6666', 'Kiran');
+    const kiran = await ctx.prisma.person.findFirstOrThrow({ where: { email: 'kiran@example.com' } });
+    const chess = await ctx.prisma.registration.findFirstOrThrow({ where: { personId: kiran.id } });
+    await ctx.prisma.registration.create({ data: { eventSlug: 'carrom', personId: kiran.id, teamId: chess.teamId, responseId: 'x1' } });
+    expect(headings((await getAs(ctx, admin, '/admin/aadhaar-duplicates').expect(200)).text)).toEqual([]); // two events: not a duplicate
+    await ctx.prisma.person.create({ data: { name: 'Kiran', email: 'kiran.old@example.com', aadhaarLast4: '6666', aadhaarEncrypted: kiran.aadhaarEncrypted, registrations: { create: { eventSlug: 'chess', responseId: 'old' } } } });
+    // The older record is not linked to the profile (no backfill yet): still grouped by the full number.
+    const text = (await getAs(ctx, admin, '/admin/aadhaar-duplicates').expect(200)).text;
+    expect(text).toContain('Participants with duplicate Aadhaar records (1)');
+    expect(text).toContain('kiran.old@example.com');
+    expect(text).toContain('kiran@example.com');
+  });
+
+  it('24-26. search narrows the list: a full number finds its one profile (any format); last 4 never merges different numbers', async () => {
+    await seed();
 
     const full = (await search('123456789012').expect(200)).text;
     expect(headings(full)).toEqual([['9012', 2]]); // Rahul's two emails, one profile
