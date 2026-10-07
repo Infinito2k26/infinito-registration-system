@@ -86,7 +86,7 @@ Every variable is documented in [.env.example](.env.example). The main ones:
 | `APP_SECRET` | Signs CSRF tokens (≥ 32 characters in production) |
 | `FORMS_WEBHOOK_SECRET` | Shared with the Apps Script (≥ 24 random characters in production) |
 | `BOOTSTRAP_ADMIN_EMAILS` | Comma-separated; made active admins on every start |
-| `EMAIL_PROVIDER`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` | Email provider: Resend (default) or SMTP, e.g. Gmail (§34) |
+| `EMAIL_PROVIDER`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` | Email provider: Resend (default) or SMTP, e.g. Gmail (§34). `EMAIL_PROVIDER` is only the default: an admin's choice under Staff → Email provider takes precedence |
 | `RESEND_API_KEY`, `MAIL_FROM`, `MAIL_REPLY_TO`, `RESEND_WEBHOOK_SECRET` | Email (§34) |
 | `EMAIL_TEST_RECIPIENT` | Development only: deliver every email to one inbox |
 | `EMAIL_WORKER_ENABLED` | Set `false` on all but one instance per database |
@@ -599,8 +599,17 @@ A background worker sends them through the provider chosen by `EMAIL_PROVIDER`:
   `EMAIL_SEND_INTERVAL_MS=2000`. The login is checked at start-up ("Email provider login OK/failed"
   in the log). There is no delivery webhook and no provider-side idempotency key with SMTP.
 
-Switching provider is only a change of these values (then restart). To check the setup, run
-`npm run email:test -- you@example.com`.
+**Choosing the active provider.** Admins can switch between SMTP and Resend under **Staff → Email
+provider** (no restart). Precedence: the admin's saved choice (database setting `email.provider`)
+wins; until an admin saves one, `EMAIL_PROVIDER` from `.env` is used. Only the choice is stored;
+SMTP and Resend credentials always come from `.env`, and a provider that is not configured there
+cannot be selected. If the selected provider later stops being configured, emails stay queued (no
+silent fallback) and the page shows "SMTP is selected but SMTP is not configured." Switching only
+changes the sender: queued emails keep their send-once keys and nothing is sent twice.
+Admin-only endpoints: `GET /admin/staff/email-provider` (JSON, no secrets) and
+`POST /admin/staff/email-provider` (`provider=smtp|resend`).
+
+To check the .env setup, run `npm run email:test -- you@example.com` (it uses `EMAIL_PROVIDER`).
 
 How the worker behaves:
 - **No duplicates.** Each email has a unique idempotency key, which is also sent to Resend.

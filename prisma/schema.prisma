@@ -315,6 +315,7 @@ model StaffUser {
   triggeredEmails       EmailOutbox[]
   emailBatches          EmailBatch[]
   verificationBatches   VerificationBatch[]
+  settingsUpdated       SystemSetting[]
   blockedPeople         Person[]               @relation("PersonBlockedBy")
 }
 
@@ -444,4 +445,15 @@ model VerificationBatchItem {
 
   @@index([batchId])
   @@index([registrationId])
+}
+
+/// Admin-changeable settings. Never secrets: credentials stay in .env. Currently one key:
+/// "email.provider" = "smtp" | "resend" (overrides EMAIL_PROVIDER once an admin saves it).
+model SystemSetting {
+  key         String   @id
+  value       String
+  updatedById String?  @db.Uuid
+  updatedAt   DateTime @updatedAt
+
+  updatedBy StaffUser? @relation(fields: [updatedById], references: [id], onDelete: SetNull)
 }
