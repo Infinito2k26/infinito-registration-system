@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
   NotFoundException,
   Param,
   ParseUUIDPipe,
@@ -34,6 +35,7 @@ import { WebExceptionFilter } from '../web/web-exception.filter';
 import { dateOnly } from '../forms/form-response.parser';
 import { decryptAadhaar } from '../registrations/aadhaar-crypto';
 import { ManualRegistrationError, ManualRegistrationService, sanitize } from '../registrations/manual-registration.service';
+import { AadhaarDuplicatesService, AadhaarSearchError } from './aadhaar-duplicates.service';
 import { AdminQueryService, ExpectedKind, REGISTRATION_VIEWS, RegistrationView } from './admin-query.service';
 import {
   collegePage,
@@ -43,6 +45,7 @@ import {
   participantPage,
   registrationsPage,
   teamPage,
+  aadhaarDuplicatesPage,
   manualParticipantPage,
   verificationBatchPage,
   verificationReportPage,
@@ -92,6 +95,7 @@ export class AdminController {
     private readonly payments: PaymentsService,
     private readonly bulkVerification: BulkVerificationService,
     private readonly manualRegistrations: ManualRegistrationService,
+    private readonly aadhaarDuplicates: AadhaarDuplicatesService,
     private readonly qrEmails: QrEmailService,
     private readonly collegeEmails: CollegeEmailService,
     private readonly participants: ParticipantsService,
@@ -487,6 +491,36 @@ export class AdminController {
     const batch = await this.bulkVerification.batch(id);
     if (!batch) throw new NotFoundException('Bulk verification not found');
     this.render(req, res, 'Bulk verification', 'verifications', verificationBatchPage({ batch, eventName: this.eventName }));
+  }
+
+  // ---------- Aadhaar duplicate check (ADMIN only) ----------
+
+  /** Aadhaar numbers shared by more than one registration. Report only: nothing is changed. */
+  @Get('aadhaar-duplicates')
+  @Roles(StaffRole.ADMIN)
+  async aadhaarDuplicateReport(@Req() req: StaffRequest, @Res() res: Response, @Query('people') people?: string) {
+    res.set('Cache-Control', 'no-store');
+    const onlyDifferentParticipants = people === '1';
+    const report = await this.aadhaarDuplicates.duplicates(onlyDifferentParticipants);
+    this.render(req, res, 'Aadhaar duplicates', 'aadhaar', aadhaarDuplicatesPage({ report, onlyDifferentParticipants, canCompare: this.aadhaarDuplicates.canCompare, csrf: this.auth.csrfToken(req.staff!.sessionId), eventName: this.eventName }));
+  }
+
+  /** Search by full number or last 4 digits. POST, so the number never appears in URLs or access logs. */
+  @Post('aadhaar-duplicates/search')
+  @HttpCode(200)
+  @Roles(StaffRole.ADMIN)
+  async aadhaarSearch(@Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
+    res.set('Cache-Control', 'no-store');
+    const report = await this.aadhaarDuplicates.duplicates(false);
+    let search: Awaited<ReturnType<AadhaarDuplicatesService['search']>> | undefined;
+    let error: string | undefined;
+    try {
+      search = await this.aadhaarDuplicates.search(text(body.aadhaar, 40));
+    } catch (e) {
+      if (!(e instanceof AadhaarSearchError)) throw e;
+      error = e.message;
+    }
+    this.render(req, res, 'Aadhaar duplicates', 'aadhaar', aadhaarDuplicatesPage({ report, onlyDifferentParticipants: false, canCompare: this.aadhaarDuplicates.canCompare, csrf: this.auth.csrfToken(req.staff!.sessionId), eventName: this.eventName, search, searchError: error }));
   }
 
   // ---------- gate log ----------
