@@ -77,51 +77,69 @@ export class ParticipantsService {
   }
 
   /**
-   * Blocks the participant's QR at the gate (every event): no check-in, no check-out, until
-   * unblocked. Verification, QR token and IN/OUT history are untouched.
+   * The Person records forming this participant, locked for a block decision: the whole Aadhaar
+   * profile (every email / QR record), or just this person without a profile.
+   */
+  private async blockScope(tx: Prisma.TransactionClient, personId: string) {
+    const person = await tx.person.findUnique({ where: { id: personId }, select: { participantProfileId: true } });
+    if (!person) throw new ParticipantActionError('Participant not found');
+    const scope = person.participantProfileId ? `profile:${person.participantProfileId}` : `person:${personId}`;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'participant-block:' + scope}))`;
+    return tx.person.findMany({
+      where: person.participantProfileId ? { participantProfileId: person.participantProfileId } : { id: personId },
+      include: { registrations: { select: { id: true, insideSince: true } } },
+    });
+  }
+
+  /**
+   * Blocks the participant at the gate (every event): no check-in, no check-out, until unblocked.
+   * Profile-wide: every record of the same full Aadhaar (other emails / QR codes) is blocked too, so
+   * the block cannot be bypassed with another QR. Verification, QR tokens and IN/OUT history are
+   * untouched.
    */
   async block(personId: string, actorId: string, rawReason: string): Promise<void> {
     const reason = rawReason.trim().slice(0, 500) || null;
     await this.prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'person-block:' + personId}))`;
-      const person = await tx.person.findUnique({ where: { id: personId }, include: { registrations: { select: { id: true, insideSince: true } } } });
-      if (!person) throw new ParticipantActionError('Participant not found');
-      if (person.blockedAt) throw new ParticipantActionError('Already blocked');
-      await tx.person.update({
-        where: { id: personId },
+      const people = await this.blockScope(tx, personId);
+      if (people.some((p) => p.blockedAt)) throw new ParticipantActionError('Already blocked');
+      await tx.person.updateMany({
+        where: { id: { in: people.map((p) => p.id) } },
         data: { blockedAt: new Date(), blockedById: actorId, blockReason: reason },
       });
       await recordActivity(
         tx,
-        person.registrations.map((r) => ({
-          registrationId: r.id,
-          type: ActivityType.BLOCKED,
-          actorId,
-          details: { reason, wasInside: r.insideSince !== null },
-        })),
+        people.flatMap((p) =>
+          p.registrations.map((r) => ({
+            registrationId: r.id,
+            type: ActivityType.BLOCKED,
+            actorId,
+            details: { reason, wasInside: r.insideSince !== null, profileWide: people.length > 1 || undefined },
+          })),
+        ),
       );
     });
   }
 
-  /** Lifts the block; the gate then follows the participant's current IN/OUT state again. */
+  /** Lifts the block for the whole participant (every record of the profile); the gate then follows each registration's IN/OUT state again. */
   async unblock(personId: string, actorId: string): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'person-block:' + personId}))`;
-      const person = await tx.person.findUnique({ where: { id: personId }, include: { registrations: { select: { id: true } } } });
-      if (!person) throw new ParticipantActionError('Participant not found');
-      if (!person.blockedAt) throw new ParticipantActionError('Not blocked');
-      await tx.person.update({
-        where: { id: personId },
+      const people = await this.blockScope(tx, personId);
+      const blocked = people.find((p) => p.blockedAt);
+      if (!blocked) throw new ParticipantActionError('Not blocked');
+      await tx.person.updateMany({
+        where: { id: { in: people.map((p) => p.id) } },
         data: { blockedAt: null, blockedById: null, blockReason: null },
       });
       await recordActivity(
         tx,
-        person.registrations.map((r) => ({
-          registrationId: r.id,
-          type: ActivityType.UNBLOCKED,
-          actorId,
-          details: { previousReason: person.blockReason, blockedSince: person.blockedAt?.toISOString() ?? null },
-        })),
+        people.flatMap((p) =>
+          p.registrations.map((r) => ({
+            registrationId: r.id,
+            type: ActivityType.UNBLOCKED,
+            actorId,
+            details: { previousReason: blocked.blockReason, blockedSince: blocked.blockedAt?.toISOString() ?? null, profileWide: people.length > 1 || undefined },
+          })),
+        ),
       );
     });
   }

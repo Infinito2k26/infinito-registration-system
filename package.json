@@ -22,6 +22,7 @@
     "test:cov": "jest --coverage",
     "check-types": "tsc --noEmit",
     "email:test": "ts-node src/cli/send-test-email.ts",
+    "profiles:backfill": "node dist/src/cli/backfill-participant-profiles.js",
     "test:e2e": "jest --config test/jest-e2e.json --runInBand"
   },
   "prisma": {

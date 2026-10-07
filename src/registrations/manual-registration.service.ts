@@ -97,7 +97,10 @@ export class ManualRegistrationService {
         },
         parsed.value,
       );
-      return { registrationIds: await this.registrationIdsFor(responseId), warnings: [...parsed.warnings, ...result.warnings] };
+      const registrationIds = await this.registrationIdsFor(responseId);
+      // Same full Aadhaar already registered for every chosen event: nothing was created.
+      if (registrationIds.length === 0) throw new ManualRegistrationError(result.warnings.length ? result.warnings : ['No registration was created']);
+      return { registrationIds, warnings: [...parsed.warnings, ...result.warnings] };
     } catch (error) {
       if (error instanceof RegistrationConflictError) throw new ManualRegistrationError(error.errors);
       if (error instanceof RegistrationRetryableError) {

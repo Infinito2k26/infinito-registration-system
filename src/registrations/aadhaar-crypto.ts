@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+import { createCipheriv, createDecipheriv, createHmac, randomBytes } from 'crypto';
 
 /**
  * Full Aadhaar numbers are stored only encrypted (AES-256-GCM, random IV, authenticated), as
@@ -32,6 +32,23 @@ export function decryptAadhaar(stored: string | null | undefined, key: Buffer | 
   } catch {
     return null;
   }
+}
+
+/** Only the digits: "1234 5678-9012" and "123456789012" are the same Aadhaar number. */
+export const normalizeAadhaar = (value: string) => value.replace(/\D/g, '');
+
+/**
+ * Deterministic identity of a FULL Aadhaar number for ParticipantProfile matching: HMAC-SHA256
+ * of the 12 digits with a key derived (domain-separated) from AADHAAR_ENCRYPTION_KEY. The number
+ * cannot be recovered from it, and without the key it cannot be guessed by trying numbers.
+ * Returns null unless there are exactly 12 digits. Rotating the key changes every fingerprint
+ * (then re-run the profile backfill).
+ */
+export function aadhaarFingerprint(value: string, key: Buffer): string | null {
+  const digits = normalizeAadhaar(value);
+  if (digits.length !== 12) return null;
+  const fingerprintKey = createHmac('sha256', key).update('infinito/participant-profile/aadhaar/v1').digest();
+  return createHmac('sha256', fingerprintKey).update(digits).digest('base64url');
 }
 
 /** "1234 5678 9012" for admins; "XXXX XXXX 9012" for everyone else. */

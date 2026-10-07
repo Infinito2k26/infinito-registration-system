@@ -36,7 +36,8 @@ export function viewWhere(view: RegistrationView): Prisma.RegistrationWhereInput
     case 'REJECTED':
       return { paymentStatus: view };
     case 'BLOCKED':
-      return { person: { blockedAt: { not: null } } };
+      // The participant is blocked if any record of the same Aadhaar profile is.
+      return { person: { OR: [{ blockedAt: { not: null } }, { participantProfile: { people: { some: { blockedAt: { not: null } } } } }] } };
     case 'INSIDE':
       return { insideSince: { not: null } };
     case 'OUTSIDE':
@@ -259,6 +260,18 @@ export class AdminQueryService {
       summary: summarize(rows),
       colleges: [...byCollege.values()].map((g) => ({ id: g.id, name: g.name, summary: summarize(g.rows) })),
     };
+  }
+
+  /** What the delete confirmation shows. */
+  registrationForDeletion(id: string) {
+    return this.prisma.registration.findUnique({
+      where: { id },
+      select: { id: true, personId: true, eventSlug: true, paymentStatus: true, createdAt: true, enteredAt: true, insideSince: true, person: { select: { name: true, email: true, college: true } } },
+    });
+  }
+
+  registrationCountForPerson(personId: string) {
+    return this.prisma.registration.count({ where: { personId } });
   }
 
   async collegeOptions() {

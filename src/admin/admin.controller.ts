@@ -35,6 +35,8 @@ import { WebExceptionFilter } from '../web/web-exception.filter';
 import { dateOnly } from '../forms/form-response.parser';
 import { decryptAadhaar } from '../registrations/aadhaar-crypto';
 import { ManualRegistrationError, ManualRegistrationService, sanitize } from '../registrations/manual-registration.service';
+import { ParticipantProfileService } from '../registrations/participant-profile.service';
+import { RegistrationDeletionError, RegistrationDeletionService } from '../registrations/registration-deletion.service';
 import { AadhaarDuplicatesService, AadhaarSearchError } from './aadhaar-duplicates.service';
 import { AdminQueryService, ExpectedKind, REGISTRATION_VIEWS, RegistrationView } from './admin-query.service';
 import {
@@ -46,6 +48,7 @@ import {
   registrationsPage,
   teamPage,
   aadhaarDuplicatesPage,
+  deleteRegistrationPage,
   manualParticipantPage,
   verificationBatchPage,
   verificationReportPage,
@@ -96,6 +99,8 @@ export class AdminController {
     private readonly bulkVerification: BulkVerificationService,
     private readonly manualRegistrations: ManualRegistrationService,
     private readonly aadhaarDuplicates: AadhaarDuplicatesService,
+    private readonly profiles: ParticipantProfileService,
+    private readonly registrationDeletions: RegistrationDeletionService,
     private readonly qrEmails: QrEmailService,
     private readonly collegeEmails: CollegeEmailService,
     private readonly participants: ParticipantsService,
@@ -222,6 +227,10 @@ export class AdminController {
     // else the encrypted value is dropped before rendering and only the last 4 digits remain.
     const aadhaarFull = isAdmin ? decryptAadhaar(detail.reg.person.aadhaarEncrypted, this.config.aadhaarKey) : null;
     detail.reg.person.aadhaarEncrypted = null;
+    const profile = await this.profiles.view(detail.reg.personId);
+    // Blocking is per participant (Aadhaar profile): show the block of any of its records here too.
+    const blockedRecord = detail.reg.person.blockedAt ? null : profile?.people.find((p) => p.blockedAt);
+    if (blockedRecord) Object.assign(detail.reg.person, { blockedAt: blockedRecord.blockedAt, blockReason: blockedRecord.blockReason, blockedBy: blockedRecord.blockedBy });
     this.render(
       req,
       res,
@@ -236,6 +245,7 @@ export class AdminController {
         eventName: this.eventName,
         driveEnabled: this.drive.enabled,
         delaySeconds: this.config.decisionEmailDelaySeconds,
+        profile,
       }),
     );
   }
@@ -495,14 +505,12 @@ export class AdminController {
 
   // ---------- Aadhaar duplicate check (ADMIN only) ----------
 
-  /** Aadhaar numbers shared by more than one registration. Report only: nothing is changed. */
+  /** Search first: nothing is listed until an admin searches. */
   @Get('aadhaar-duplicates')
   @Roles(StaffRole.ADMIN)
-  async aadhaarDuplicateReport(@Req() req: StaffRequest, @Res() res: Response, @Query('people') people?: string) {
+  aadhaarDuplicateReport(@Req() req: StaffRequest, @Res() res: Response) {
     res.set('Cache-Control', 'no-store');
-    const onlyDifferentParticipants = people === '1';
-    const report = await this.aadhaarDuplicates.duplicates(onlyDifferentParticipants);
-    this.render(req, res, 'Aadhaar duplicates', 'aadhaar', aadhaarDuplicatesPage({ report, onlyDifferentParticipants, canCompare: this.aadhaarDuplicates.canCompare, csrf: this.auth.csrfToken(req.staff!.sessionId), eventName: this.eventName }));
+    this.render(req, res, 'Aadhaar duplicates', 'aadhaar', aadhaarDuplicatesPage({ canCompare: this.aadhaarDuplicates.canCompare, csrf: this.auth.csrfToken(req.staff!.sessionId), eventName: this.eventName }));
   }
 
   /** Search by full number or last 4 digits. POST, so the number never appears in URLs or access logs. */
@@ -511,7 +519,6 @@ export class AdminController {
   @Roles(StaffRole.ADMIN)
   async aadhaarSearch(@Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
     res.set('Cache-Control', 'no-store');
-    const report = await this.aadhaarDuplicates.duplicates(false);
     let search: Awaited<ReturnType<AadhaarDuplicatesService['search']>> | undefined;
     let error: string | undefined;
     try {
@@ -520,7 +527,33 @@ export class AdminController {
       if (!(e instanceof AadhaarSearchError)) throw e;
       error = e.message;
     }
-    this.render(req, res, 'Aadhaar duplicates', 'aadhaar', aadhaarDuplicatesPage({ report, onlyDifferentParticipants: false, canCompare: this.aadhaarDuplicates.canCompare, csrf: this.auth.csrfToken(req.staff!.sessionId), eventName: this.eventName, search, searchError: error }));
+    this.render(req, res, 'Aadhaar duplicates', 'aadhaar', aadhaarDuplicatesPage({ canCompare: this.aadhaarDuplicates.canCompare, csrf: this.auth.csrfToken(req.staff!.sessionId), eventName: this.eventName, search, searchError: error }));
+  }
+
+  /** Confirmation page. Delete exists ONLY here (Duplicate Aadhaar Check), for admins. */
+  @Get('aadhaar-duplicates/registrations/:id/delete')
+  @Roles(StaffRole.ADMIN)
+  async confirmDeleteRegistration(@Param('id', ParseUUIDPipe) id: string, @Req() req: StaffRequest, @Res() res: Response) {
+    const reg = await this.queries.registrationForDeletion(id);
+    if (!reg) throw new NotFoundException('Registration not found (already deleted?)');
+    const others = await this.queries.registrationCountForPerson(reg.personId);
+    this.render(req, res, 'Delete registration', 'aadhaar', deleteRegistrationPage({ reg, others: others - 1, csrf: this.auth.csrfToken(req.staff!.sessionId), eventName: this.eventName }));
+  }
+
+  @Post('aadhaar-duplicates/registrations/:id/delete')
+  @Roles(StaffRole.ADMIN)
+  async deleteRegistration(@Param('id', ParseUUIDPipe) id: string, @Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
+    if (body.confirm !== 'yes') {
+      this.flashAndBack(res, { type: 'error', text: 'Tick the confirmation to delete the registration' }, `/admin/aadhaar-duplicates/registrations/${id}/delete`);
+      return;
+    }
+    try {
+      const { eventSlug, personName } = await this.registrationDeletions.delete(id, req.staff!.id);
+      this.flashAndBack(res, { type: 'ok', text: `Deleted the ${this.eventName(eventSlug)} registration of ${personName ?? 'the participant'}` }, '/admin/aadhaar-duplicates');
+    } catch (error) {
+      if (!(error instanceof RegistrationDeletionError)) throw error;
+      this.flashAndBack(res, { type: 'error', text: error.message }, '/admin/aadhaar-duplicates');
+    }
   }
 
   // ---------- gate log ----------

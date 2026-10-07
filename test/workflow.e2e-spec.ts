@@ -22,6 +22,10 @@ describe('Individual form workflow (e2e)', () => {
     coordinator = await staff(ctx, StaffRole.COORDINATOR);
   });
 
+  /** A distinct Aadhaar per participant (one Aadhaar = one participant); Priya keeps 1234 5678 9012. */
+  const aadhaarFor = (email: string) =>
+    email.trim().toLowerCase().startsWith('priya') ? '1234 5678 9012' : `5${String([...email].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 100_000_000_000, 7)).padStart(11, '0')}`;
+
   /** A row of the actual response sheet. */
   const row = (o: { name: string; email: string; college: string; sport?: string; roll?: string; mobile?: string }) => ({
     'Email Address *': o.email,
@@ -31,7 +35,7 @@ describe('Individual form workflow (e2e)', () => {
     'Mobile No.': o.mobile ?? '9876500000',
     'College Roll No.': o.roll ?? `R-${o.name}`,
     'College ID Card Photo': 'https://drive.google.com/open?id=1CollegeIdCardFileIdAAAAA',
-    'Aadhaar No.': '1234 5678 9012',
+    'Aadhaar No.': aadhaarFor(o.email),
     'Aadhaar Card Photo': 'https://drive.google.com/open?id=1AadhaarCardFileIdBBBBBB',
     'Check In Date': '10/10/2026',
     'Check Out Date': '12/10/2026',

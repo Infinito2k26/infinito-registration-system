@@ -5,6 +5,7 @@ import { formatAadhaar, maskAadhaar } from '../registrations/aadhaar-crypto';
 import { QrEmailSummary } from '../emails/qr-email.service';
 import { BULK_VERIFY_MAX, BulkVerificationService, ReportEmailStatus, reportEmailStatus } from '../payments/bulk-verification.service';
 import { AadhaarDuplicatesService, AadhaarGroup } from './aadhaar-duplicates.service';
+import { ParticipantProfileService } from '../registrations/participant-profile.service';
 import { SafeHtml, html } from '../web/html';
 import { BadgeTone, badge, csrfField, fmtDate, fmtDay, fmtExact, paymentBadge } from '../web/layout';
 import {
@@ -28,6 +29,7 @@ type Batches = Awaited<ReturnType<CollegeEmailService['batches']>>;
 type EntryList = Awaited<ReturnType<AdminQueryService['entries']>>;
 type ExpectedList = Awaited<ReturnType<AdminQueryService['expected']>>;
 type VerificationBatches = Awaited<ReturnType<BulkVerificationService['batches']>>;
+type ProfileView = NonNullable<Awaited<ReturnType<ParticipantProfileService['view']>>>;
 type VerificationBatchDetail = NonNullable<Awaited<ReturnType<BulkVerificationService['batch']>>>;
 type EventName = (slug: string) => string;
 
@@ -468,6 +470,8 @@ export function participantPage(args: {
   eventName: EventName;
   driveEnabled: boolean;
   delaySeconds: number;
+  /** The whole participant (Aadhaar profile): every email, registration, QR and email record. */
+  profile?: ProfileView | null;
 }): SafeHtml {
   const { detail, csrf, eventName, driveEnabled } = args;
   const { reg, activity, emails } = detail;
@@ -527,6 +531,8 @@ export function participantPage(args: {
     <p class="muted small">${p.email ? 'Keeps the same participant, QR pass and history. Nothing is emailed automatically; use Send QR email afterwards.' : 'No email yet. Adding one keeps the same participant, QR pass and history, and emails the QR pass if the registration is verified.'}</p>
   </section>
 
+  ${args.profile ? participantProfileSection(args.profile, reg.id, eventName) : null}
+
   <section class="card">
     <h2>Verification</h2>
     <dl class="facts">
@@ -570,7 +576,7 @@ export function participantPage(args: {
 
   <section class="card">
     <h2>Gate (actual IN / OUT)</h2>
-    <p class="muted small">CHECK IN / CHECK OUT here works without scanning the QR. It follows the same rules as a scan (verified, not blocked, current state) and is recorded as a manual action under your name.</p>
+    <p class="muted small">CHECK IN / CHECK OUT here works without scanning the QR. It follows the same rules as a scan (verified, not blocked, current state) and is recorded as a manual action under your name. The participant has one IN/OUT status: it applies to all their registrations (every event and email of the same Aadhaar).</p>
     <dl class="facts">
       <dt>Now</dt><dd>${presenceBadge(reg)}${reg.insideSince ? html` since ${fmtExact(reg.insideSince)}` : null}</dd>
       <dt>Actual check-in</dt><dd>${reg.lastCheckInAt ? fmtExact(reg.lastCheckInAt) : html`<span class="muted">Not yet</span>`}${reg.enteredAt && reg.lastCheckInAt && reg.enteredAt.getTime() !== reg.lastCheckInAt.getTime() ? html` <span class="muted small">(first entry ${fmtExact(reg.enteredAt)})</span>` : null}</dd>
@@ -1147,25 +1153,28 @@ export function manualParticipantPage(args: {
     </section>`;
 }
 
-/** One Aadhaar number (masked) and its registrations, numbered, linking to each participant page. */
+/** One participant (Aadhaar profile), masked, with each registration and its Delete link. */
 function aadhaarGroupCard(group: AadhaarGroup, eventName: EventName, label?: string): SafeHtml {
   const count = group.registrations.length;
   return html`<section class="card">
-    <h2 class="mono">${maskAadhaar(group.last4)}${label ? html` <span class="muted small">${label}</span>` : null} — ${count} registration${count === 1 ? '' : 's'}${group.participants > 1 ? html` · <span class="error-text">${group.participants} different participants</span>` : html` · <span class="muted">same participant</span>`}</h2>
-    <div class="table-wrap"><table class="table rows-clickable">
-      <thead><tr><th>#</th><th>Participant</th><th>Email</th><th>Mobile</th><th>College</th><th>Event</th><th>Status</th><th>Registered</th><th>Verified</th></tr></thead>
+    <h2 class="mono">${maskAadhaar(group.last4)}${label ? html` <span class="muted small">${label}</span>` : null} — ${count} registration${count === 1 ? '' : 's'}${group.participants > 1 ? html` · ${group.participants} email records` : null}</h2>
+    <p class="muted small">${group.profileId ? 'One participant profile (same full Aadhaar).' : group.last4 ? 'Not linked to a profile yet (run the profile backfill), or only the last 4 digits are on file.' : ''}</p>
+    ${group.duplicateEvents.length ? html`<div class="warning"><b>Duplicate registrations:</b> ${group.duplicateEvents.map(eventName).join(', ')} (same participant, same event, more than once).</div>` : null}
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>#</th><th>Participant</th><th>Email</th><th>Mobile</th><th>College</th><th>Event</th><th>Status</th><th>Registered</th><th>Verified</th><th></th></tr></thead>
       <tbody>
         ${group.registrations.map(
-          (r, i) => html`<tr data-href="/admin/registrations/${r.registrationId}">
+          (r, i) => html`<tr>
             <td>${i + 1}</td>
             <td><a href="/admin/registrations/${r.registrationId}">${r.name ?? 'Participant'}</a>${r.manual ? html` ${badge('manual', 'info')}` : null}</td>
             <td class="small">${r.email ?? html`<span class="muted">none</span>`}</td>
             <td class="small">${r.phone ?? ''}</td>
             <td class="small">${r.college ?? ''}</td>
-            <td class="small">${eventName(r.eventSlug)}</td>
-            <td>${paymentBadge(r.paymentStatus)}${r.blocked ? html` ${badge('BLOCKED', 'bad')}` : null}</td>
+            <td class="small">${eventName(r.eventSlug)}${group.duplicateEvents.includes(r.eventSlug) ? html` ${badge('duplicate', 'warn')}` : null}</td>
+            <td>${paymentBadge(r.paymentStatus)}${r.blocked ? html` ${badge('BLOCKED', 'bad')}` : null}${r.enteredAt ? html` ${badge('entered', 'info')}` : null}</td>
             <td class="small">${fmtDate(r.registeredAt)}</td>
             <td class="small">${r.paymentStatus === PaymentStatus.VERIFIED && r.reviewedAt ? fmtDate(r.reviewedAt) : ''}</td>
+            <td><a class="button small danger" href="/admin/aadhaar-duplicates/registrations/${r.registrationId}/delete">Delete</a></td>
           </tr>`,
         )}
       </tbody>
@@ -1174,47 +1183,138 @@ function aadhaarGroupCard(group: AadhaarGroup, eventName: EventName, label?: str
 }
 
 /**
- * ADMIN Aadhaar duplicate check: numbers shared by more than one registration, plus a search by
- * full number or last 4 digits. Numbers are always shown masked; this only reports, the admin
- * decides (verify, reject, block) on each participant's page.
+ * ADMIN Duplicate Aadhaar Check: search first (nothing is listed until an admin searches). A full
+ * number shows its one participant profile; last 4 digits show each possible profile separately.
+ * Numbers are always masked. Deleting a registration is only possible from here.
  */
 export function aadhaarDuplicatesPage(args: {
-  report: Awaited<ReturnType<AadhaarDuplicatesService['duplicates']>>;
-  onlyDifferentParticipants: boolean;
   canCompare: boolean;
   csrf: string;
   eventName: EventName;
   search?: Awaited<ReturnType<AadhaarDuplicatesService['search']>>;
   searchError?: string;
 }): SafeHtml {
-  const { report, search, eventName } = args;
+  const { search, eventName } = args;
   const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
   return html`<h1>Aadhaar duplicates</h1>
-    <p class="muted">Aadhaar numbers used by more than one registration (form and manual entries), compared on the 12 digits whatever the spacing. Report only: nothing is rejected automatically. Open a participant to verify, reject or block.</p>
-    ${args.canCompare ? null : html`<div class="warning">AADHAAR_ENCRYPTION_KEY is not configured, so full numbers cannot be compared. Only the last-4 search below works.</div>`}
+    <p class="muted">Search a participant by Aadhaar. One full Aadhaar number = one participant profile, whatever the emails; the last 4 digits alone never identify a participant. Report only: nothing is rejected automatically.</p>
+    ${args.canCompare ? null : html`<div class="warning">AADHAAR_ENCRYPTION_KEY is not configured, so full numbers cannot be compared. Only the last-4 search works.</div>`}
     <section class="card">
-      <h2>Search Aadhaar</h2>
+      <h2>Search Aadhaar / last 4 digits</h2>
       <form method="post" action="/admin/aadhaar-duplicates/search" class="row-form" autocomplete="off">
         ${csrfField(args.csrf)}
         <label>Aadhaar number or last 4 digits <input name="aadhaar" inputmode="numeric" maxlength="20" required autocomplete="off"></label>
         <button class="primary">Search</button>
       </form>
       ${args.searchError ? html`<p class="error-text">${args.searchError}</p>` : null}
-      ${
-        search
-          ? search.groups.length === 0
-            ? html`<p>No registrations with ${search.kind === 'full' ? 'this Aadhaar number' : html`an Aadhaar number ending <span class="mono">${search.last4}</span>`}.</p>`
-            : html`<p>${search.kind === 'full' ? 'This Aadhaar number' : html`Aadhaar numbers ending <span class="mono">${search.last4}</span>`}: ${search.groups.reduce((n, g) => n + g.registrations.length, 0)} registration(s)${search.kind === 'last4' && search.groups.length > 1 ? html` across ${search.groups.length} different numbers (A, B, …)` : null}.</p>
-              ${search.groups.map((g, i) => aadhaarGroupCard(g, eventName, search.kind === 'last4' && search.groups.length > 1 ? `number ${letters[i] ?? i + 1}` : undefined))}`
-          : null
-      }
     </section>
-    <h2>Shared Aadhaar numbers</h2>
-    <p class="small">
-      ${args.onlyDifferentParticipants
-        ? html`Showing numbers shared by <b>different participants</b>. <a href="/admin/aadhaar-duplicates">Show all (incl. one participant in several events)</a>`
-        : html`Showing every number with more than one registration (incl. one participant in several events). <a href="/admin/aadhaar-duplicates?people=1">Only different participants</a>`}
-    </p>
-    <p class="muted small">${report.groups.length} shared number(s) · ${report.comparableParticipants} participant(s) with a full Aadhaar number compared${report.last4OnlyParticipants ? ` · ${report.last4OnlyParticipants} with only the last 4 digits (not comparable; use the search)` : ''}. Participants without Aadhaar are not included.</p>
-    ${report.groups.length ? report.groups.map((g) => aadhaarGroupCard(g, eventName)) : html`<p class="muted">No shared Aadhaar numbers.</p>`}`;
+    ${
+      search
+        ? search.groups.length === 0
+          ? html`<p>No registrations with ${search.kind === 'full' ? 'this Aadhaar number' : html`an Aadhaar number ending <span class="mono">${search.last4}</span>`}.</p>`
+          : html`<p>${search.kind === 'full' ? 'This Aadhaar number' : html`Aadhaar numbers ending <span class="mono">${search.last4}</span>`}: ${search.groups.reduce((n, g) => n + g.registrations.length, 0)} registration(s)${search.kind === 'last4' && search.groups.length > 1 ? html` across ${search.groups.length} different participants (A, B, …); the last 4 digits alone do not identify a participant` : null}.</p>
+            ${search.groups.map((g, i) => aadhaarGroupCard(g, eventName, search.kind === 'last4' && search.groups.length > 1 ? `participant ${letters[i] ?? i + 1}` : undefined))}`
+        : null
+    }`;
+}
+
+/** Confirmation before permanently deleting one registration (Duplicate Aadhaar Check only). */
+export function deleteRegistrationPage(args: {
+  reg: { id: string; eventSlug: string; paymentStatus: PaymentStatus; createdAt: Date; enteredAt: Date | null; insideSince: Date | null; person: { name: string | null; email: string | null; college: string | null } };
+  others: number;
+  csrf: string;
+  eventName: EventName;
+}): SafeHtml {
+  const { reg } = args;
+  return html`<p class="small"><a href="/admin/aadhaar-duplicates">← Aadhaar duplicates</a></p>
+    <h1>Delete registration</h1>
+    <section class="card narrow">
+      <div class="warning"><b>Are you sure you want to permanently delete this registration?</b></div>
+      <dl class="facts">
+        <dt>Participant</dt><dd>${reg.person.name ?? 'Participant'}</dd>
+        <dt>Email</dt><dd>${reg.person.email ?? html`<span class="muted">none</span>`}</dd>
+        <dt>College</dt><dd>${reg.person.college ?? ''}</dd>
+        <dt>Event</dt><dd>${args.eventName(reg.eventSlug)}</dd>
+        <dt>Status</dt><dd>${paymentBadge(reg.paymentStatus)}${reg.insideSince ? html` ${badge('INSIDE now', 'warn')}` : reg.enteredAt ? html` ${badge('has entered', 'info')}` : null}</dd>
+        <dt>Registered</dt><dd>${fmtDate(reg.createdAt)}</dd>
+        <dt>Other registrations</dt><dd>${args.others} (kept)</dd>
+      </dl>
+      <p class="muted small">Only this registration is deleted. The participant, their other registrations, QR codes and profile stay. Its gate log entries and email history are kept (no longer linked), emails still waiting for it are cancelled, and a deletion record is kept. A resync of the form does not bring it back.</p>
+      <form method="post" action="/admin/aadhaar-duplicates/registrations/${reg.id}/delete" class="stack">
+        ${csrfField(args.csrf)}
+        <label><input type="checkbox" name="confirm" value="yes" required> I understand this registration is deleted permanently</label>
+        <button class="danger">Delete this registration</button>
+      </form>
+    </section>`;
+}
+
+/** "pu***@gmail.com" for the email history. */
+const maskRecipient = (email: string) => email.replace(/^([^@]{1,2})[^@]*(@.*)$/, '$1***$2');
+
+const EMAIL_TEMPLATE_LABEL: Record<string, string> = {
+  'qr-pass': 'QR Pass',
+  'payment-rejected': 'Rejection',
+  'college-passes': 'College passes',
+  'registration-received': 'Registration received (no longer sent)',
+  'staff-login': 'Staff sign-in',
+};
+
+/**
+ * The participant (Aadhaar profile) on the participant page: every email address, registration,
+ * QR code and email record, counted from the records themselves.
+ */
+function participantProfileSection(view: ProfileView, currentId: string, eventName: EventName): SafeHtml {
+  const s = view.emailStats;
+  const emailStatus = (status: EmailStatus) =>
+    status === EmailStatus.SENT
+      ? badge('SENT', 'ok')
+      : status === EmailStatus.FAILED
+        ? badge('FAILED', 'bad')
+        : status === EmailStatus.CANCELLED
+          ? badge('CANCELLED', 'muted')
+          : badge(status === EmailStatus.PROCESSING ? 'SENDING' : 'QUEUED', 'warn');
+  return html`<section class="card">
+    <h2>Participant profile</h2>
+    <p class="muted small">${view.profile ? html`One Aadhaar profile (Aadhaar ${maskAadhaar(view.profile.aadhaarLast4)}): every registration with the same full Aadhaar, under any email, is the same participant.` : 'No full Aadhaar on file: this participant record only.'}</p>
+    <dl class="facts">
+      <dt>Emails</dt><dd>${view.emailAddresses.length ? view.emailAddresses.map((e, i) => html`${i ? html`<br>` : null}${e}`) : html`<span class="muted">No email</span>`}${view.previousEmails.length ? html`<br><span class="muted small">previous: ${view.previousEmails.join(', ')}</span>` : null}</dd>
+      <dt>Registrations</dt><dd>${view.registrations.length} · Events: ${view.events} · QR codes generated: ${view.qrCodes}</dd>
+      <dt>Email status</dt><dd>Sent: ${s.sent} · Queued: ${s.queued} · Failed: ${s.failed}${s.cancelled ? ` · Cancelled: ${s.cancelled}` : ''}<br><span class="muted small">Total email records: ${s.records} (one per email; retries are attempts of the same record)</span></dd>
+    </dl>
+    ${view.duplicateEvents.length ? html`<div class="warning">Registered more than once for: ${view.duplicateEvents.map(eventName).join(', ')} (older duplicates). An admin can review them under Aadhaar duplicates.</div>` : null}
+    <div class="table-wrap"><table class="table rows-clickable">
+      <thead><tr><th>Event</th><th>Status</th><th>Gate</th><th>Email record</th></tr></thead>
+      <tbody>
+        ${view.registrations.map(
+          (r) => html`<tr data-href="/admin/registrations/${r.id}" class="${r.id === currentId ? 'highlight' : ''}">
+            <td><a href="/admin/registrations/${r.id}">${eventName(r.eventSlug)}</a>${r.id === currentId ? html` <span class="muted small">(this page)</span>` : null}</td>
+            <td>${paymentBadge(r.paymentStatus)}</td>
+            <td>${presenceBadge(r)}</td>
+            <td class="small">${r.person.email ?? html`<span class="muted">no email</span>`}</td>
+          </tr>`,
+        )}
+      </tbody>
+    </table></div>
+    <h3>Email history</h3>
+    ${
+      view.emails.length
+        ? html`<div class="table-wrap"><table class="table small">
+            <thead><tr><th>Email</th><th>To</th><th>Status</th><th>Queued / scheduled</th><th>Sent</th><th>Failed</th><th>Attempts</th></tr></thead>
+            <tbody>
+              ${view.emails.map(
+                (e) => html`<tr>
+                  <td>${EMAIL_TEMPLATE_LABEL[e.template ?? ''] ?? e.template}</td>
+                  <td>${maskRecipient(e.toEmail)}</td>
+                  <td>${emailStatus(e.status)}${e.status === EmailStatus.FAILED && e.lastError ? html`<br><span class="error-text">${e.lastError}</span>` : null}</td>
+                  <td>${fmtExact(e.sendAt > e.createdAt ? e.sendAt : e.createdAt)}</td>
+                  <td>${e.sentAt ? fmtExact(e.sentAt) : ''}</td>
+                  <td>${e.status === EmailStatus.FAILED ? fmtExact(e.updatedAt) : ''}</td>
+                  <td>${e.attempts}</td>
+                </tr>`,
+              )}
+            </tbody>
+          </table></div>`
+        : html`<p class="muted small">No emails for this participant.</p>`
+    }
+  </section>`;
 }
