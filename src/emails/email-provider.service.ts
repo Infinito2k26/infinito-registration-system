@@ -2,14 +2,19 @@ import { Injectable } from '@nestjs/common';
 import { AppConfig } from '../config/app-config.service';
 import { PrismaService } from '../prisma/prisma.service';
 
-export const EMAIL_PROVIDERS = ['smtp', 'resend'] as const;
+export const EMAIL_PROVIDERS = ['smtp', 'resend', 'brevo'] as const;
 export type EmailProvider = (typeof EMAIL_PROVIDERS)[number];
 export const EMAIL_PROVIDER_SETTING = 'email.provider';
 
 export const isEmailProvider = (value: unknown): value is EmailProvider =>
   typeof value === 'string' && (EMAIL_PROVIDERS as readonly string[]).includes(value);
 
-export const providerLabel = (provider: EmailProvider) => (provider === 'smtp' ? 'SMTP' : 'Resend');
+const LABELS: Record<EmailProvider, string> = { smtp: 'SMTP', resend: 'Resend', brevo: 'Brevo' };
+export const providerLabel = (provider: EmailProvider) => LABELS[provider];
+
+/** Names in the admin's provider selector. */
+const OPTION_LABELS: Record<EmailProvider, string> = { smtp: 'SMTP (GoDaddy)', resend: 'Resend', brevo: 'Brevo' };
+export const providerOptionLabel = (provider: EmailProvider) => OPTION_LABELS[provider];
 
 /** "SMTP is selected but SMTP is not configured." (no silent fallback to the other provider) */
 export const notConfiguredMessage = (provider: EmailProvider) =>
@@ -63,15 +68,14 @@ export class EmailProviderService {
 
   status(provider: EmailProvider): ProviderStatus {
     const configured = this.config.emailProviderConfigured(provider);
-    const { smtp } = this.config.email;
     const from = this.config.emailFrom(provider);
-    const detail = !configured
-      ? provider === 'smtp'
-        ? 'Not configured: set SMTP_HOST, SMTP_USER and SMTP_PASS in .env'
-        : 'Not configured: set RESEND_API_KEY in .env'
-      : provider === 'smtp'
-        ? `${smtp.host}:${smtp.port} as ${from || '(no sender)'}`
-        : `as ${from || '(no sender)'}`;
+    const missing: Record<EmailProvider, string> = {
+      smtp: 'Not configured: set SMTP_HOST, SMTP_USER and SMTP_PASS in .env',
+      resend: 'Not configured: set RESEND_API_KEY in .env',
+      brevo: 'Not configured: set BREVO_SMTP_USER and BREVO_SMTP_KEY in .env',
+    };
+    const server = provider === 'resend' ? null : this.config.smtpOptions(provider);
+    const detail = !configured ? missing[provider] : `${server ? `${server.host}:${server.port} ` : ''}as ${from || '(no sender)'}`;
     return { provider, configured, problems: configured ? this.config.emailConfigProblems(provider) : [], detail };
   }
 

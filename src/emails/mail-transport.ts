@@ -95,6 +95,8 @@ export class ResendTransport implements MailTransport {
 }
 
 export interface SmtpOptions {
+  /** Transport name in logs and the status JSON (default "smtp"; "brevo" for Brevo's relay). */
+  name?: string;
   host: string;
   port: number;
   /** TLS from the start (port 465). false = STARTTLS upgrade (port 587). */
@@ -129,7 +131,7 @@ export function classifySmtpError(error: unknown): Error {
  * delivered/bounced status is only known from the SMTP reply when the email is handed over.
  */
 export class SmtpTransport implements MailTransport {
-  readonly name = 'smtp';
+  readonly name: string;
   private readonly transporter: Transporter;
 
   constructor(
@@ -138,6 +140,7 @@ export class SmtpTransport implements MailTransport {
     private readonly replyTo?: string,
     transporter?: Transporter,
   ) {
+    this.name = options.name ?? 'smtp';
     this.transporter =
       transporter ??
       createTransport({

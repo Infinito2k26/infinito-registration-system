@@ -171,6 +171,54 @@ describe('SmtpTransport', () => {
   });
 });
 
+/** Brevo SMTP relay (smtp-relay.brevo.com:587, STARTTLS) with the domain authenticated in Brevo. */
+describe('Brevo sender configuration', () => {
+  const env = {
+    EMAIL_PROVIDER: 'brevo',
+    BREVO_SMTP_HOST: 'smtp-relay.brevo.com',
+    BREVO_SMTP_PORT: '587',
+    BREVO_SMTP_USER: '8a1b2c001@smtp-brevo.com',
+    BREVO_SMTP_KEY: 'xsmtpsib-not-a-real-key',
+    BREVO_FROM_EMAIL: 'info@infinito2k26.com',
+    BREVO_FROM_NAME: 'Infinito 2K26',
+    MAIL_REPLY_TO: 'info@infinito2k26.com',
+  };
+
+  it('sends through the SMTP transport From Infinito 2K26 <info@infinito2k26.com>, with the send-once reference', async () => {
+    const config = new AppConfig(new ConfigService(env));
+    const { from, replyTo } = config.email;
+    const stream = createTransport({ streamTransport: true, buffer: true });
+    let mime = '';
+    const transport = new SmtpTransport(config.smtpOptions('brevo'), from, replyTo, {
+      sendMail: async (mail: object) => {
+        const info = (await stream.sendMail(mail)) as { message: Buffer };
+        mime = info.message.toString();
+        return info;
+      },
+    } as unknown as Transporter);
+    expect(transport.name).toBe('brevo');
+    const rendered = await renderEmail(EmailTemplate.QrPass, { name: 'Asha', eventName: 'Table Tennis', qrToken: 'tokenAAAAAAAAAAAAAAAA' });
+    await transport.send({ ...rendered, to: 'participant@example.com', subject: 'Your pass', idempotencyKey: 'qr-pass:r1:initial' });
+    expect(mime).toContain('From: Infinito 2K26 <info@infinito2k26.com>');
+    expect(mime).toContain('Reply-To: info@infinito2k26.com');
+    expect(mime).toContain('X-Infinito-Ref: qr-pass:r1:initial');
+    expect(mime).not.toContain('xsmtpsib');
+  });
+
+  it('opens smtp-relay.brevo.com:587 with STARTTLS and the SMTP login', () => {
+    const transport = new SmtpTransport(new AppConfig(new ConfigService(env)).smtpOptions('brevo'), 'x', undefined);
+    const options = (transport as unknown as { transporter: { options: Record<string, unknown> } }).transporter.options;
+    expect(options).toMatchObject({ host: 'smtp-relay.brevo.com', port: 587, secure: false, auth: { user: '8a1b2c001@smtp-brevo.com', pass: 'xsmtpsib-not-a-real-key' } });
+    transport.close();
+  });
+
+  it('maps Brevo SMTP errors like any SMTP server (bad key pauses, quota pauses longer, refused recipient fails)', () => {
+    expect(classifySmtpError({ code: 'EAUTH', responseCode: 535, response: '535 5.7.8 Authentication failed' })).toBeInstanceOf(SendPausedError);
+    expect((classifySmtpError({ responseCode: 421, response: '421 4.7.0 Daily sending quota exceeded' }) as SendPausedError).pauseMs).toBe(3_600_000);
+    expect(classifySmtpError({ code: 'EENVELOPE', responseCode: 550, response: '550 5.1.1 Recipient address rejected' })).toBeInstanceOf(PermanentSendError);
+  });
+});
+
 /**
  * GoDaddy Professional Email (smtpout.secureserver.net:465, SSL): with only the .env settings,
  * every application email (all templates) is sent From "Infinito 2K26 <info@infinito2k26.com>".

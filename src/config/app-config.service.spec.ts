@@ -50,9 +50,51 @@ describe('AppConfig', () => {
     const starttls = config({ EMAIL_PROVIDER: 'smtp', SMTP_HOST: 'smtp-relay.brevo.com', SMTP_PORT: '587', SMTP_USER: 'u', SMTP_PASS: 'p', MAIL_FROM: 'Infinito <passes@example.com>' });
     expect(starttls.email.smtp.secure).toBe(false);
     expect(starttls.email.from).toBe('Infinito <passes@example.com>');
-    expect(() => config({ ...goodProduction, EMAIL_PROVIDER: 'carrier-pigeon' })).toThrow('EMAIL_PROVIDER must be "resend" or "smtp"');
+    expect(() => config({ ...goodProduction, EMAIL_PROVIDER: 'carrier-pigeon' })).toThrow('EMAIL_PROVIDER must be "resend", "smtp" or "brevo"');
     // Resend stays the default and keeps requiring its key.
     expect(config({}).email.provider).toBe('resend');
+  });
+
+  describe('EMAIL_PROVIDER=brevo (Brevo SMTP relay)', () => {
+    const brevo = {
+      EMAIL_PROVIDER: 'brevo',
+      BREVO_SMTP_HOST: 'smtp-relay.brevo.com',
+      BREVO_SMTP_PORT: '587',
+      BREVO_SMTP_USER: '8a1b2c001@smtp-brevo.com',
+      BREVO_SMTP_KEY: 'xsmtpsib-not-a-real-key',
+      BREVO_FROM_EMAIL: 'info@infinito2k26.com',
+      BREVO_FROM_NAME: 'Infinito 2K26',
+    };
+
+    it('uses smtp-relay.brevo.com:587 (STARTTLS) with the SMTP login/key and sends as Infinito 2K26 <info@infinito2k26.com>', () => {
+      const c = config(brevo);
+      expect(c.email.brevo).toMatchObject({ host: 'smtp-relay.brevo.com', port: 587, secure: false, user: '8a1b2c001@smtp-brevo.com', pass: 'xsmtpsib-not-a-real-key' });
+      expect(c.smtpOptions('brevo')).toEqual({ name: 'brevo', host: 'smtp-relay.brevo.com', port: 587, secure: false, user: '8a1b2c001@smtp-brevo.com', pass: 'xsmtpsib-not-a-real-key' });
+      expect(c.email.from).toBe('Infinito 2K26 <info@infinito2k26.com>');
+      expect(c.emailProviderConfigured()).toBe(true);
+      expect(c.emailConfigProblems()).toEqual([]);
+      // Host, port and sender name have defaults; MAIL_FROM (the other providers' sender) is not used.
+      const minimal = config({ EMAIL_PROVIDER: 'brevo', BREVO_SMTP_USER: 'u@smtp-brevo.com', BREVO_SMTP_KEY: 'xsmtpsib-k', BREVO_FROM_EMAIL: 'Info@Infinito2k26.com', MAIL_FROM: 'Other <other@example.com>' });
+      expect(minimal.smtpOptions('brevo')).toMatchObject({ host: 'smtp-relay.brevo.com', port: 587, secure: false });
+      expect(minimal.email.from).toBe('Infinito 2K26 <info@infinito2k26.com>');
+      expect(config({ ...brevo, BREVO_FROM_NAME: 'Infinito, IIT Patna' }).email.from).toBe('"Infinito, IIT Patna" <info@infinito2k26.com>');
+      // The SMTP (GoDaddy) settings are separate and unchanged.
+      expect(config({ ...brevo, SMTP_HOST: 'smtpout.secureserver.net', SMTP_USER: 'info@infinito2k26.com', SMTP_PASS: 'x' }).smtpOptions('smtp')).toMatchObject({ host: 'smtpout.secureserver.net', port: 465 });
+    });
+
+    it('fails clearly when the SMTP credentials or the sender are missing, or an API key is used', () => {
+      expect(config({ ...brevo, BREVO_SMTP_USER: '' }).emailProviderConfigured()).toBe(false);
+      expect(config({ ...brevo, BREVO_SMTP_KEY: '' }).emailProviderConfigured()).toBe(false);
+      expect(config({ ...brevo, BREVO_FROM_EMAIL: '' }).emailConfigProblems()).toEqual([
+        'BREVO_FROM_EMAIL must be set (the sender on the domain authenticated in Brevo, e.g. info@infinito2k26.com)',
+      ]);
+      expect(config({ ...brevo, BREVO_FROM_EMAIL: 'Infinito <info@infinito2k26.com>' }).emailConfigProblems()).toEqual(['BREVO_FROM_EMAIL must be a plain email address, e.g. info@infinito2k26.com']);
+      expect(config({ ...brevo, BREVO_SMTP_KEY: 'xkeysib-an-api-key' }).emailConfigProblems()).toEqual(['BREVO_SMTP_KEY is a Brevo API key; use the SMTP key (Brevo: SMTP & API → SMTP)']);
+      const production = { ...goodProduction, RESEND_API_KEY: '', ...brevo };
+      expect(() => config(production)).not.toThrow();
+      expect(() => config({ ...production, BREVO_SMTP_KEY: '' })).toThrow('EMAIL_PROVIDER=brevo needs BREVO_SMTP_USER, BREVO_SMTP_KEY and BREVO_FROM_EMAIL');
+      expect(() => config({ ...production, BREVO_FROM_EMAIL: '' })).toThrow('EMAIL_PROVIDER=brevo needs BREVO_SMTP_USER, BREVO_SMTP_KEY and BREVO_FROM_EMAIL');
+    });
   });
 
   it('derives event display names from the slug (short words uppercased)', () => {
