@@ -86,7 +86,8 @@ Every variable is documented in [.env.example](.env.example). The main ones:
 | `APP_SECRET` | Signs CSRF tokens (≥ 32 characters in production) |
 | `FORMS_WEBHOOK_SECRET` | Shared with the Apps Script (≥ 24 random characters in production) |
 | `BOOTSTRAP_ADMIN_EMAILS` | Comma-separated; made active admins on every start |
-| `EMAIL_PROVIDER`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` | Email provider: Resend (default) or SMTP, e.g. Gmail (§34). `EMAIL_PROVIDER` is only the default: an admin's choice under Staff → Email provider takes precedence |
+| `EMAIL_PROVIDER`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` | Email provider: Resend (default), SMTP (GoDaddy, Gmail) or Brevo (§34). `EMAIL_PROVIDER` is only the default: an admin's choice under Staff → Email provider takes precedence |
+| `BREVO_SMTP_HOST`, `BREVO_SMTP_PORT`, `BREVO_SMTP_USER`, `BREVO_SMTP_KEY`, `BREVO_FROM_EMAIL`, `BREVO_FROM_NAME` | Brevo SMTP relay (§34): `smtp-relay.brevo.com:587`, the SMTP login and **SMTP key** (not the API key), sender `Infinito 2K26 <info@infinito2k26.com>` |
 | `RESEND_API_KEY`, `MAIL_FROM`, `MAIL_REPLY_TO`, `RESEND_WEBHOOK_SECRET` | Email (§34) |
 | `EMAIL_TEST_RECIPIENT` | Development only: deliver every email to one inbox |
 | `EMAIL_WORKER_ENABLED` | Set `false` on all but one instance per database |
@@ -574,7 +575,7 @@ horizontal page overflow.
 - **Inputs** use 16px text, so iOS doesn't zoom in.
 - **Nothing depends on hover.**
 
-## 34. Email worker (Resend or SMTP)
+## 34. Email worker (Resend, SMTP or Brevo)
 
 All emails go through `EmailOutbox`:
 - QR pass
@@ -599,18 +600,28 @@ A background worker sends them through the provider chosen by `EMAIL_PROVIDER`:
   500 emails/day (free) or 2,000/day (paid Workspace): set `EMAIL_DAILY_CAP` a little below that and
   `EMAIL_SEND_INTERVAL_MS=2000`. The login is checked at start-up ("Email provider login OK/failed"
   in the log). There is no delivery webhook and no provider-side idempotency key with SMTP.
+- **Brevo** (`EMAIL_PROVIDER=brevo`, or chosen by an admin): Brevo's SMTP relay, sent through the
+  same SMTP sender (same retries, pauses and send-once rules as SMTP). `BREVO_SMTP_HOST=smtp-relay.brevo.com`,
+  `BREVO_SMTP_PORT=587` (STARTTLS), `BREVO_SMTP_USER` = the SMTP login shown in Brevo → SMTP & API
+  → SMTP, `BREVO_SMTP_KEY` = an **SMTP key** from that page (`xsmtpsib-…`; an API key `xkeysib-…`
+  is refused with a clear message), `BREVO_FROM_EMAIL=info@infinito2k26.com`,
+  `BREVO_FROM_NAME="Infinito 2K26"`. The domain is authenticated in Brevo, so this sender is
+  accepted. `MAIL_FROM` is not used for Brevo; `MAIL_REPLY_TO` is. Without the login, key or
+  sender, Brevo cannot be selected (and with `EMAIL_PROVIDER=brevo` production refuses to start).
+  Set `EMAIL_DAILY_CAP` to your Brevo plan's daily limit (free plan: 300/day, e.g. `EMAIL_DAILY_CAP=290`).
 
-**Choosing the active provider.** Admins can switch between SMTP and Resend under **Staff → Email
-provider** (no restart). Precedence: the admin's saved choice (database setting `email.provider`)
+**Choosing the active provider.** Admins can switch between SMTP (GoDaddy), Resend and Brevo under
+**Staff → Email provider** (no restart). Precedence: the admin's saved choice (database setting `email.provider`)
 wins; until an admin saves one, `EMAIL_PROVIDER` from `.env` is used. Only the choice is stored;
-SMTP and Resend credentials always come from `.env`, and a provider that is not configured there
+SMTP, Resend and Brevo credentials always come from `.env`, and a provider that is not configured there
 cannot be selected. If the selected provider later stops being configured, emails stay queued (no
 silent fallback) and the page shows "SMTP is selected but SMTP is not configured." Switching only
 changes the sender: queued emails keep their send-once keys and nothing is sent twice.
 Admin-only endpoints: `GET /admin/staff/email-provider` (JSON, no secrets) and
-`POST /admin/staff/email-provider` (`provider=smtp|resend`).
+`POST /admin/staff/email-provider` (`provider=smtp|resend|brevo`).
 
-To check the .env setup, run `npm run email:test -- you@example.com` (it uses `EMAIL_PROVIDER`).
+To check the .env setup, run `npm run email:test -- you@example.com` (it uses `EMAIL_PROVIDER`;
+`EMAIL_PROVIDER=brevo npm run email:test -- you@example.com` checks Brevo).
 
 How the worker behaves:
 - **No duplicates.** Each email has a unique idempotency key, which is also sent to Resend.
@@ -736,8 +747,9 @@ With `NODE_ENV=production` the app **refuses to start** if any of these is true:
 - `APP_SECRET` is shorter than 32 characters.
 - `FORMS_WEBHOOK_SECRET` is shorter than 24 characters, or is still the placeholder.
 - `APP_BASE_URL` is not `https://`.
-- `RESEND_API_KEY` is missing (`EMAIL_PROVIDER=resend`, the default), or `SMTP_HOST`,
-  `SMTP_USER` or `SMTP_PASS` is missing (`EMAIL_PROVIDER=smtp`).
+- `RESEND_API_KEY` is missing (`EMAIL_PROVIDER=resend`, the default), `SMTP_HOST`,
+  `SMTP_USER` or `SMTP_PASS` is missing (`EMAIL_PROVIDER=smtp`), or `BREVO_SMTP_USER`,
+  `BREVO_SMTP_KEY` or `BREVO_FROM_EMAIL` is missing (`EMAIL_PROVIDER=brevo`).
 
 Production also ignores `EMAIL_TEST_RECIPIENT`. Cookies are `Secure` over https.
 
@@ -760,6 +772,17 @@ Checklist:
 - [ ] Apps Script `WEBHOOK_URL` and `WEBHOOK_SECRET` updated; *Resync unsent rows* run once.
 - [ ] Drive service account set up if photos are needed.
 - [ ] Gate dry run on real phones, plus printed per-college name lists as the offline fallback.
+
+**Adding Brevo on the server** (no migration needed): add the `BREVO_*` lines to `.env`, then
+
+```bash
+npm ci && npm run build
+EMAIL_PROVIDER=brevo npm run email:test -- you@example.com   # one real test email via Brevo
+pm2 restart infinito --update-env
+```
+
+then choose **Brevo** under Admin → Staff → Email provider. Queued emails are sent with it from
+then on; nothing already sent is sent again.
 
 A Cloudflare tunnel is only a local testing aid; the app doesn't depend on one.
 

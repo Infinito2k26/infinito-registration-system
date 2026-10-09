@@ -10,6 +10,7 @@ import {
   isEmailProvider,
   notConfiguredMessage,
   providerLabel,
+  providerOptionLabel,
 } from '../emails/email-provider.service';
 import { EmailWorkerService } from '../emails/email-worker.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -112,7 +113,7 @@ export class StaffController {
             ${csrfField(csrf)}
             ${email.providers.map(
               (p) => html`<label><input type="radio" name="provider" value="${p.provider}" ${p.provider === email.provider ? 'checked' : ''}>
-                ${providerLabel(p.provider)} <span class="muted small">(${p.detail}${p.problems.length ? `; ${p.problems.join('; ')}` : ''})</span></label>`,
+                ${providerOptionLabel(p.provider)} <span class="muted small">(${p.detail}${p.problems.length ? `; ${p.problems.join('; ')}` : ''})</span></label>`,
             )}
             <button class="primary">Save</button>
           </form>
@@ -136,12 +137,12 @@ export class StaffController {
     });
   }
 
-  /** Admin-only: choose the active email provider ("smtp" | "resend"); it must be configured in .env. */
+  /** Admin-only: choose the active email provider ("smtp" | "resend" | "brevo"); it must be configured in .env. */
   @Post('email-provider')
   async setEmailProvider(@Body() body: Record<string, unknown>, @Req() req: StaffRequest, @Res() res: Response) {
     const provider = body.provider;
     if (!isEmailProvider(provider)) {
-      setFlash(res, { type: 'error', text: 'Choose SMTP or Resend' }, this.config.secureCookies);
+      setFlash(res, { type: 'error', text: 'Choose SMTP, Resend or Brevo' }, this.config.secureCookies);
       return res.redirect(303, '/admin/staff');
     }
     try {

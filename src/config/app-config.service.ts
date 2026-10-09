@@ -3,6 +3,9 @@ import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
 import { parseAadhaarKey } from '../registrations/aadhaar-crypto';
 
+const KNOWN_PROVIDERS = ['resend', 'smtp', 'brevo'];
+const UNKNOWN_PROVIDER = 'EMAIL_PROVIDER must be "resend", "smtp" or "brevo"';
+
 /** Typed access to environment settings, with the defaults documented in .env.example. */
 @Injectable()
 export class AppConfig {
@@ -32,12 +35,15 @@ export class AppConfig {
     if (!this.str('APP_BASE_URL').startsWith('https://')) {
       problems.push('APP_BASE_URL must be the public https:// URL');
     }
-    const { provider, smtp } = this.email;
+    const { provider, smtp, brevo } = this.email;
     if (provider === 'resend' && !this.str('RESEND_API_KEY')) problems.push('RESEND_API_KEY must be set');
     if (provider === 'smtp' && !(smtp.host && smtp.user && smtp.pass)) {
       problems.push('EMAIL_PROVIDER=smtp needs SMTP_HOST, SMTP_USER and SMTP_PASS');
     }
-    if (provider !== 'resend' && provider !== 'smtp') problems.push('EMAIL_PROVIDER must be "resend" or "smtp"');
+    if (provider === 'brevo' && !(brevo.user && brevo.pass && brevo.fromEmail)) {
+      problems.push('EMAIL_PROVIDER=brevo needs BREVO_SMTP_USER, BREVO_SMTP_KEY and BREVO_FROM_EMAIL');
+    }
+    if (!KNOWN_PROVIDERS.includes(provider)) problems.push(UNKNOWN_PROVIDER);
     return problems;
   }
 
@@ -93,10 +99,25 @@ export class AppConfig {
       // Gmail shows app passwords in groups of four ("abcd efgh ..."); the spaces are not part of it.
       pass: this.str('SMTP_PASS').replace(/\s+/g, ''),
     };
+    const brevoPort = this.num('BREVO_SMTP_PORT', 587);
+    /** Brevo's SMTP relay (BREVO_SMTP_KEY is the SMTP key, not the API key); sent through SmtpTransport. */
+    const brevo = {
+      name: 'brevo',
+      host: this.str('BREVO_SMTP_HOST') || 'smtp-relay.brevo.com',
+      port: brevoPort,
+      /** 587 = STARTTLS (Brevo's default); 465 = TLS from the start. */
+      secure: brevoPort === 465,
+      user: this.str('BREVO_SMTP_USER'),
+      pass: this.str('BREVO_SMTP_KEY'),
+      /** Sender on the domain authenticated in Brevo (infinito2k26.com). */
+      fromEmail: this.str('BREVO_FROM_EMAIL').toLowerCase(),
+      fromName: this.str('BREVO_FROM_NAME') || 'Infinito 2K26',
+    };
     return {
-      /** "resend" (default) or "smtp" (e.g. Gmail / Google Workspace with an app password). */
+      /** "resend" (default), "smtp" (GoDaddy, Gmail...) or "brevo" (Brevo SMTP relay). */
       provider,
       smtp,
+      brevo,
       resendApiKey: this.str('RESEND_API_KEY'),
       webhookSecret: this.str('RESEND_WEBHOOK_SECRET'),
       /**
@@ -120,10 +141,25 @@ export class AppConfig {
     };
   }
 
-  /** Sender for a provider: MAIL_FROM, or for SMTP the SMTP account itself. */
+  /**
+   * Sender for a provider: Brevo uses BREVO_FROM_NAME <BREVO_FROM_EMAIL> (nothing else); the
+   * others MAIL_FROM, or for SMTP the SMTP account itself.
+   */
   emailFrom(provider: string): string {
+    if (provider === 'brevo') {
+      const name = this.str('BREVO_FROM_NAME') || 'Infinito 2K26';
+      const address = this.str('BREVO_FROM_EMAIL').toLowerCase();
+      if (!address) return '';
+      return `${/^[\w .-]+$/.test(name) ? name : `"${name.replace(/["\\<>]/g, '')}"`} <${address}>`;
+    }
     const user = this.str('SMTP_USER');
     return this.str('MAIL_FROM') || (provider === 'smtp' && user ? `Infinito 2K26 <${user}>` : '');
+  }
+
+  /** SMTP connection settings of an SMTP-based provider (SMTP or Brevo). */
+  smtpOptions(provider: string) {
+    const { smtp, brevo } = this.email;
+    return provider === 'brevo' ? { name: brevo.name, host: brevo.host, port: brevo.port, secure: brevo.secure, user: brevo.user, pass: brevo.pass } : smtp;
   }
 
   /**
@@ -131,18 +167,27 @@ export class AppConfig {
    * can also be chosen by an admin (EmailProviderService); credentials always come from .env.
    */
   emailProviderConfigured(provider: string = this.email.provider): boolean {
-    const { resendApiKey, smtp } = this.email;
+    const { resendApiKey, smtp, brevo } = this.email;
+    if (provider === 'brevo') return Boolean(brevo.host && brevo.user && brevo.pass);
     return provider === 'smtp' ? Boolean(smtp.host && smtp.user && smtp.pass) : provider === 'resend' && Boolean(resendApiKey);
   }
 
   /** Human-readable problems with a provider's settings (default: EMAIL_PROVIDER); empty when sending can start. */
   emailConfigProblems(provider: string = this.email.provider): string[] {
-    const { resendApiKey, replyTo } = this.email;
+    const { resendApiKey, replyTo, brevo } = this.email;
     const from = this.emailFrom(provider);
     const problems: string[] = [];
-    if (provider !== 'resend' && provider !== 'smtp') return ['EMAIL_PROVIDER must be "resend" or "smtp"'];
+    if (!KNOWN_PROVIDERS.includes(provider)) return [UNKNOWN_PROVIDER];
     if (!this.emailProviderConfigured(provider)) return problems;
     if (provider === 'resend' && !resendApiKey.startsWith('re_')) problems.push('RESEND_API_KEY should start with "re_"');
+    if (provider === 'brevo') {
+      // Brevo API keys start with "xkeysib-"; SMTP needs the SMTP key (Brevo: SMTP & API -> SMTP).
+      if (brevo.pass.startsWith('xkeysib-')) problems.push('BREVO_SMTP_KEY is a Brevo API key; use the SMTP key (Brevo: SMTP & API → SMTP)');
+      if (!brevo.fromEmail) problems.push('BREVO_FROM_EMAIL must be set (the sender on the domain authenticated in Brevo, e.g. info@infinito2k26.com)');
+      else if (!/^[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+$/.test(brevo.fromEmail)) problems.push('BREVO_FROM_EMAIL must be a plain email address, e.g. info@infinito2k26.com');
+      if (replyTo && !/^[^<>\s]+@[^<>\s]+$/.test(replyTo)) problems.push('MAIL_REPLY_TO must be a plain email address');
+      return problems;
+    }
     const address = from.match(/<([^<>\s]+@[^<>\s]+)>\s*$/)?.[1] ?? (/^[^<>\s]+@[^<>\s]+$/.test(from) ? from : '');
     if (!address) problems.push('MAIL_FROM must be "Name <address@your-verified-domain>"');
     if (replyTo && !/^[^<>\s]+@[^<>\s]+$/.test(replyTo)) problems.push('MAIL_REPLY_TO must be a plain email address');

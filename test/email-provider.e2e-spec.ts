@@ -20,6 +20,12 @@ describe('Email provider setting (e2e)', () => {
     SMTP_PASS: 'not-a-real-password',
     RESEND_API_KEY: 're_not_a_real_key',
     MAIL_FROM: 'Infinito 2K26 <info@example.test>',
+    BREVO_SMTP_HOST: 'smtp-relay.brevo.com',
+    BREVO_SMTP_PORT: '587',
+    BREVO_SMTP_USER: '8a1b2c001@smtp-brevo.com',
+    BREVO_SMTP_KEY: 'xsmtpsib-not-a-real-brevo-key',
+    BREVO_FROM_EMAIL: 'info@infinito2k26.com',
+    BREVO_FROM_NAME: 'Infinito 2K26',
   };
   const saved: Record<string, string | undefined> = {};
 
@@ -56,6 +62,7 @@ describe('Email provider setting (e2e)', () => {
     expect(raw).toContain('smtp.example.test:465 as Infinito 2K26 <info@example.test>');
     expect(raw).not.toContain('not-a-real-password');
     expect(raw).not.toContain('re_not_a_real_key');
+    expect(raw).not.toContain('xsmtpsib-not-a-real-brevo-key');
     const page = (await getAs(ctx, admin, '/admin/staff').expect(200)).text;
     expect(page).toContain('<h2>Email provider</h2>');
     expect(page).toContain('Active: <b>Resend</b>');
@@ -93,7 +100,7 @@ describe('Email provider setting (e2e)', () => {
   it('rejects invalid values and unconfigured providers; nothing changes', async () => {
     await choose('smtp').expect(303);
     for (const bad of ['carrier-pigeon', 'SMTP ', '']) {
-      expect(flash(await choose(bad).expect(303))).toBe('Choose SMTP or Resend');
+      expect(flash(await choose(bad).expect(303))).toBe('Choose SMTP, Resend or Brevo');
     }
     expect((await current()).provider).toBe('smtp');
     process.env.RESEND_API_KEY = '';
@@ -137,6 +144,94 @@ describe('Email provider setting (e2e)', () => {
       ['asha@example.com', EmailStatus.SENT, '<smtp-id@example.test>'],
       ['bina@example.com', EmailStatus.SENT, 'resend-id-1'],
     ]);
+  });
+
+  describe('Brevo', () => {
+    const verifyNew = async (responseId: string, name: string) => {
+      await submitRow(ctx, responseId, { 'Email Address': `${name.toLowerCase()}@example.com`, Name: name, 'College Name': 'NIT Patna', Sports: 'TT' }).expect(200);
+      const reg = await ctx.prisma.registration.findFirstOrThrow({ where: { person: { name } } });
+      await postAs(ctx, admin, `/admin/registrations/${reg.id}/verify`).expect(303);
+    };
+
+    it('is the third option on the Staff page, described without its SMTP key', async () => {
+      const page = (await getAs(ctx, admin, '/admin/staff').expect(200)).text;
+      for (const [value, label] of [['smtp', 'SMTP (GoDaddy)'], ['resend', 'Resend'], ['brevo', 'Brevo']]) {
+        expect(page).toMatch(new RegExp(`value="${value}"[^>]*>\\s*${label.replace(/[()]/g, '\\$&')} <span`));
+      }
+      expect(page).toContain('smtp-relay.brevo.com:587 as Infinito 2K26 &lt;info@infinito2k26.com&gt;');
+      expect(page).not.toContain('xsmtpsib-not-a-real-brevo-key');
+      const state = await current();
+      expect(state.providers.map((p) => p.provider)).toEqual(['smtp', 'resend', 'brevo']);
+      expect(JSON.stringify(state)).not.toContain('xsmtpsib');
+    });
+
+    it('selected Brevo sends the queue (QR passes and notices) as Infinito 2K26 <info@infinito2k26.com>; persists; switching never resends', async () => {
+      const via: { transport: string; to: string; template?: string }[] = [];
+      let ids = 0;
+      jest.spyOn(SmtpTransport.prototype, 'send').mockImplementation(function (this: SmtpTransport, email) {
+        via.push({ transport: this.name, to: email.to, template: email.tags?.template });
+        return Promise.resolve(`<${this.name}-${++ids}@example.test>`);
+      });
+      const resendSend = jest.spyOn(ResendTransport.prototype, 'send').mockResolvedValue('resend-id');
+
+      // An email sent earlier with SMTP (GoDaddy).
+      await choose('smtp').expect(303);
+      await verifyNew('r1', 'Asha');
+      expect(await ctx.worker.processBatch()).toBe(1);
+
+      expect(flash(await choose('brevo').expect(303))).toBe('Email provider set to Brevo');
+      expect(await current()).toMatchObject({ provider: 'brevo', source: 'admin' });
+      expect((await getAs(ctx, admin, '/admin/staff').expect(200)).text).toContain('Active: <b>Brevo</b>');
+      await verifyNew('r2', 'Bina');
+      // A notice queued now goes through Brevo too.
+      const notice = await postAs(ctx, admin, '/admin/notices', { title: 'T', subject: 'Notice', body: 'Hello', action: 'ready' }).expect(303);
+      const noticeId = /([0-9a-f-]{36})$/.exec(notice.headers.location)![1];
+      const chetan = await ctx.prisma.person.create({ data: { name: 'Chetan', email: 'chetan@example.com', registrations: { create: { eventSlug: 'tt', responseId: 'r3' } } } });
+      await postAs(ctx, admin, `/admin/notices/${noticeId}/recipients`, { ids: chetan.id }).expect(303);
+      await postAs(ctx, admin, `/admin/notices/${noticeId}/send`, { confirm: 'yes', reviewedAt: new Date(Date.now() + 1000).toISOString() }).expect(303);
+      expect(await ctx.worker.processBatch()).toBe(2);
+      expect(ctx.worker.transportName).toBe('brevo');
+      expect(via).toEqual([
+        { transport: 'smtp', to: 'asha@example.com', template: EmailTemplate.QrPass },
+        { transport: 'brevo', to: 'bina@example.com', template: EmailTemplate.QrPass },
+        { transport: 'brevo', to: 'chetan@example.com', template: EmailTemplate.Notice },
+      ]);
+      expect(resendSend).not.toHaveBeenCalled();
+      expect((await ctx.prisma.emailOutbox.findFirstOrThrow({ where: { toEmail: 'bina@example.com' } })).providerMessageId).toBe('<brevo-2@example.test>');
+
+      // The choice survives a restart and overrides EMAIL_PROVIDER (resend here).
+      const restarted = await startApp();
+      try {
+        await restarted.worker.processBatch();
+        expect([restarted.worker.provider, restarted.worker.transportName]).toEqual(['brevo', 'brevo']);
+      } finally {
+        await restarted.app.close();
+      }
+
+      // Switching away and back sends nothing again.
+      await choose('resend').expect(303);
+      expect(await ctx.worker.processBatch()).toBe(0);
+      await choose('brevo').expect(303);
+      expect(await ctx.worker.processBatch()).toBe(0);
+      expect(via).toHaveLength(3);
+      expect(await ctx.prisma.emailOutbox.count({ where: { status: EmailStatus.SENT } })).toBe(3);
+    });
+
+    it('cannot be selected without its SMTP key or sender; nothing changes', async () => {
+      await choose('smtp').expect(303);
+      for (const [key, message] of [
+        ['BREVO_SMTP_KEY', /^Brevo is not configured in \.env, so it cannot be selected\. Not configured: set BREVO_SMTP_USER and BREVO_SMTP_KEY in \.env/],
+        ['BREVO_FROM_EMAIL', /^Brevo cannot be selected: BREVO_FROM_EMAIL must be set/],
+      ] as const) {
+        process.env[key] = '';
+        try {
+          expect(flash(await choose('brevo').expect(303))).toMatch(message);
+          expect((await current()).provider).toBe('smtp');
+        } finally {
+          process.env[key] = providerEnv[key];
+        }
+      }
+    });
   });
 
   describe('switching after a Resend quota pause', () => {

@@ -60,7 +60,7 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
    * if the selected one is not configured, production sends nothing (emails stay queued).
    */
   private createTransport(provider: EmailProvider): MailTransport | null {
-    const { smtp, resendApiKey, replyTo, testRecipient } = this.config.email;
+    const { resendApiKey, replyTo, testRecipient } = this.config.email;
     const from = this.config.emailFrom(provider);
     if (!this.config.emailProviderConfigured(provider)) {
       if (this.config.isProduction) {
@@ -78,11 +78,12 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
       this.logger.error(`Email sending disabled, fix .env: ${problems.join('; ')}`);
       return null;
     }
+    const smtp = provider === 'resend' ? null : this.config.smtpOptions(provider);
     this.logger.log(
-      `Sending via ${provider === 'smtp' ? `SMTP ${smtp.host}:${smtp.port}` : 'Resend'} as ${from}${replyTo ? `, reply-to ${replyTo}` : ''}` +
+      `Sending via ${smtp ? `${providerLabel(provider)} ${smtp.host}:${smtp.port}` : 'Resend'} as ${from}${replyTo ? `, reply-to ${replyTo}` : ''}` +
         (testRecipient ? `. TEST MODE: every email is delivered to ${testRecipient}` : ''),
     );
-    return provider === 'smtp' ? new SmtpTransport(smtp, from, replyTo) : new ResendTransport(resendApiKey, from, replyTo);
+    return smtp ? new SmtpTransport(smtp, from, replyTo) : new ResendTransport(resendApiKey, from, replyTo);
   }
 
   /** Until when the queue is paused (quota, rate limit, bad login), or null when it is not. */

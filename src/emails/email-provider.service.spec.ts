@@ -61,6 +61,63 @@ describe('EmailProviderService', () => {
   });
 });
 
+describe('EmailProviderService with Brevo', () => {
+  const brevo = {
+    BREVO_SMTP_USER: '8a1b2c001@smtp-brevo.com',
+    BREVO_SMTP_KEY: 'xsmtpsib-very-secret-key',
+    BREVO_FROM_EMAIL: 'info@infinito2k26.com',
+    BREVO_FROM_NAME: 'Infinito 2K26',
+  };
+
+  it('Brevo is a third option; selecting it persists the choice', async () => {
+    const prisma = fakePrisma();
+    const providers = service({ ...smtpOnly, ...brevo }, prisma);
+    await providers.set('brevo', 'admin-id');
+    await expect(providers.active()).resolves.toMatchObject({ provider: 'brevo', source: 'admin' });
+    expect(prisma.store.get(EMAIL_PROVIDER_SETTING)?.value).toBe('brevo');
+    // A restart reads the same saved choice, over the .env default (smtp).
+    await expect(service({ ...smtpOnly, ...brevo }, prisma).active()).resolves.toMatchObject({ provider: 'brevo', source: 'admin' });
+  });
+
+  it('cannot be selected without its SMTP credentials or sender (nothing saved)', async () => {
+    const prisma = fakePrisma();
+    await expect(service({ ...smtpOnly, ...brevo, BREVO_SMTP_KEY: '' }, prisma).set('brevo', 'admin-id')).rejects.toThrow(
+      'Brevo is not configured in .env, so it cannot be selected. Not configured: set BREVO_SMTP_USER and BREVO_SMTP_KEY in .env.',
+    );
+    await expect(service({ ...smtpOnly, ...brevo, BREVO_FROM_EMAIL: '' }, prisma).set('brevo', 'admin-id')).rejects.toThrow('Brevo cannot be selected: BREVO_FROM_EMAIL must be set');
+    expect(prisma.store.size).toBe(0);
+  });
+
+  it('describes Brevo without its key', () => {
+    const status = service({ ...smtpOnly, ...brevo }).status('brevo');
+    expect(status).toEqual({ provider: 'brevo', configured: true, problems: [], detail: 'smtp-relay.brevo.com:587 as Infinito 2K26 <info@infinito2k26.com>' });
+    expect(JSON.stringify(status)).not.toContain('xsmtpsib');
+    expect(service(smtpOnly).status('brevo')).toMatchObject({ configured: false, detail: 'Not configured: set BREVO_SMTP_USER and BREVO_SMTP_KEY in .env' });
+  });
+
+  it('the worker sends with Brevo (SMTP transport named "brevo") and switches back', async () => {
+    const config = new AppConfig(new ConfigService({ NODE_ENV: 'production', APP_SECRET: 'a'.repeat(64), FORMS_WEBHOOK_SECRET: 'b'.repeat(32), APP_BASE_URL: 'https://x.test', EMAIL_WORKER_ENABLED: 'false', ...smtpOnly, ...brevo, RESEND_API_KEY: 're_live_key' }));
+    const prisma = fakePrisma();
+    const providers = new EmailProviderService(prisma as unknown as PrismaService, config);
+    const worker = new EmailWorkerService(prisma as unknown as PrismaService, config, providers);
+    await worker.refreshProvider();
+    expect(worker.transportName).toBe('smtp');
+    for (const [provider, transport] of [['brevo', 'brevo'], ['resend', 'resend'], ['brevo', 'brevo'], ['smtp', 'smtp']] as const) {
+      await providers.set(provider, 'admin-id');
+      await worker.refreshProvider();
+      expect([worker.provider, worker.transportName]).toEqual([provider, transport]);
+    }
+  });
+
+  it('selected Brevo whose key was removed: sends nothing, no fallback', async () => {
+    const config = new AppConfig(new ConfigService({ NODE_ENV: 'production', APP_SECRET: 'a'.repeat(64), FORMS_WEBHOOK_SECRET: 'b'.repeat(32), APP_BASE_URL: 'https://x.test', EMAIL_WORKER_ENABLED: 'false', ...smtpOnly }));
+    const prisma = fakePrisma('brevo');
+    const worker = new EmailWorkerService(prisma as unknown as PrismaService, config, new EmailProviderService(prisma as unknown as PrismaService, config));
+    await worker.refreshProvider();
+    expect([worker.provider, worker.transportName]).toEqual(['brevo', 'disabled']);
+  });
+});
+
 describe('EmailWorkerService provider selection', () => {
   const production = { NODE_ENV: 'production', APP_SECRET: 'a'.repeat(64), FORMS_WEBHOOK_SECRET: 'b'.repeat(32), APP_BASE_URL: 'https://x.test', EMAIL_WORKER_ENABLED: 'false' };
 

@@ -1,7 +1,8 @@
 /**
  * Sends one real sample QR-pass email with the current .env settings, bypassing the
- * database and outbox, to check the email settings: EMAIL_PROVIDER with RESEND_API_KEY or
- * SMTP_HOST / SMTP_USER / SMTP_PASS, and MAIL_FROM / MAIL_REPLY_TO.
+ * database and outbox, to check the email settings: EMAIL_PROVIDER with RESEND_API_KEY,
+ * SMTP_HOST / SMTP_USER / SMTP_PASS, or BREVO_SMTP_USER / BREVO_SMTP_KEY / BREVO_FROM_EMAIL,
+ * and MAIL_FROM / MAIL_REPLY_TO. EMAIL_PROVIDER=brevo npm run email:test -- ... tests Brevo.
  *
  *   npm run email:test -- you@example.com
  */
@@ -17,9 +18,15 @@ async function main() {
   if (!to) throw new Error('Usage: npm run email:test -- you@example.com');
 
   const config = new AppConfig(new ConfigService());
-  const { provider, smtp, resendApiKey, from, replyTo } = config.email;
+  const { provider, resendApiKey, from, replyTo } = config.email;
   if (!config.emailProviderConfigured()) {
-    throw new Error(provider === 'smtp' ? 'SMTP_HOST / SMTP_USER / SMTP_PASS are empty in .env' : 'RESEND_API_KEY is empty in .env');
+    throw new Error(
+      provider === 'smtp'
+        ? 'SMTP_HOST / SMTP_USER / SMTP_PASS are empty in .env'
+        : provider === 'brevo'
+          ? 'BREVO_SMTP_USER / BREVO_SMTP_KEY are empty in .env'
+          : 'RESEND_API_KEY is empty in .env',
+    );
   }
   const problems = config.emailConfigProblems();
   if (problems.length) throw new Error(problems.join('; '));
@@ -31,7 +38,7 @@ async function main() {
     qrToken: 'sample-token-not-a-real-pass',
   });
   const transport: MailTransport =
-    provider === 'smtp' ? new SmtpTransport(smtp, from, replyTo) : new ResendTransport(resendApiKey, from, replyTo);
+    provider === 'resend' ? new ResendTransport(resendApiKey, from, replyTo) : new SmtpTransport(config.smtpOptions(provider), from, replyTo);
   const id = await transport.send({
     ...rendered,
     to,
