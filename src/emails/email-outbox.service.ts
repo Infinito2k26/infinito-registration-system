@@ -14,6 +14,8 @@ export interface OutboxEmail {
   triggeredById?: string;
   /** Bulk college send this email belongs to. */
   batchId?: string;
+  /** Admin notice recipient this delivery is for. */
+  noticeRecipientId?: string;
   sendAt?: Date;
 }
 

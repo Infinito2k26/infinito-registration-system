@@ -190,6 +190,7 @@ describe('GoDaddy sender configuration', () => {
     [EmailTemplate.QrPass]: { name: 'Asha', eventName: 'Table Tennis', team: null, college: 'NIT Patna', qrToken: 'tokenAAAAAAAAAAAAAAAA' },
     [EmailTemplate.PaymentRejected]: { name: 'Asha', eventName: 'Table Tennis', team: null, transactionId: null, remarks: 'ID unreadable' },
     [EmailTemplate.StaffLogin]: { name: 'Coordinator', ttlMinutes: 15, url: 'https://example.test/auth/magic?token=x' },
+    [EmailTemplate.Notice]: { noticeId: 'n1', subject: 'Schedule', body: 'Football at 4 pm.' },
     [EmailTemplate.CollegePasses]: { recipientName: 'Asha', college: 'NIT Patna', eventName: null, part: 1, parts: 1, passes: [{ name: 'Asha', events: 'Table Tennis', qrToken: 'tokenAAAAAAAAAAAAAAAA' }] },
   };
 

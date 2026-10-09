@@ -542,6 +542,7 @@ Navigation only mirrors it; an unauthorised direct request gets **403**.
 | College bulk emails | ✅ | ✅ | ❌ 403 |
 | Change email | ✅ | ✅ | ✅ from the gate card only (same logic and audit); the dashboard route stays ❌ 403 |
 | Block / unblock | ✅ | ✅ | ❌ 403 |
+| Notices (Admin → Notices: create, select recipients, send, retry, report) | ✅ | ❌ 403 | ❌ 403 |
 | Check IN/OUT: QR scan and manual gate card | ✅ | ✅ | ✅ |
 | Check IN/OUT from the participant page | ✅ | ✅ | ❌ |
 | Blocked-participant check-out override | ✅ | ❌ | ❌ |
@@ -670,6 +671,51 @@ npm run profiles:backfill -- --apply # link existing people to profiles
 It only sets `Person.participantProfileId`, never merges records or changes registrations, QR
 tokens, emails, gate logs or activity, prints the counts before and after, and fails if any
 changed. Safe to run again.
+
+## 34b. Admin notices
+
+**Admin → Notices** (ADMIN only, enforced on every route; coordinators and volunteers get 403).
+
+1. **Create notice:** title (internal), email subject, message (plain text: escaped, line
+   breaks kept, http(s) links clickable; HTML is never run). *Save notice* = ready to send,
+   *Save as draft* = can be edited and test-sent only, *Preview* saves nothing, *Test email*
+   goes only to the signed-in admin (not a recipient).
+2. **Select recipients** on the notice page, tab **Not yet selected**: every participant with a
+   valid email who is not a recipient yet, read from the database. Search (name, email, mobile,
+   college, roll no.), filter by college, event and registration status, 50 per page, a tick-all
+   box per page; ticks are kept across pages and filters in that browser tab, then *Add selected
+   recipients*; or *Add all matching* (up to 5000 per click). Added recipients are stored
+   (`NoticeRecipient`), nothing is sent.
+3. **Review and send:** lists every selected, not-yet-queued recipient and the message; the admin
+   ticks the confirmation. Only recipients that were on the review screen are queued.
+
+**One recipient per email address per notice** (unique `noticeId + email` and `noticeId +
+personId`): a participant whose address is already a recipient (also through another record)
+is skipped. Different emails of one Aadhaar profile are different addresses and can each be
+selected. Missing or invalid emails are listed under **Ineligible** and can never be queued.
+
+**Lists:** Not yet selected (no recipient record) · Selected, not queued (awaiting confirmation)
+· Pending / queued (in the email queue, including retries and quota pauses) · Sent (accepted by
+the provider; not proof of delivery or reading, Resend webhook reports are shown when they
+arrive) · Failed (permanent failure or out of retries) · Ineligible · History (audit trail:
+created, edited, added, removed, queued, retried, resumed, test sent, with who and when).
+States are read from the EmailOutbox rows, never assumed from queueing.
+
+**Sending:** each delivery is an ordinary EmailOutbox row (`template = notice`, one recipient,
+send-once key `notice:<recipientId>:<attempt>`), sent by the normal worker with the active
+provider (Staff → Email provider), its rate limit, daily cap, quota pause and retry/backoff.
+QR passes and other participant emails are picked before notice deliveries, so a big notice never
+delays a pass. The subject and message lock when the first delivery is queued, and every
+delivery carries that same version. Every write holds a lock on the notice: double clicks,
+refreshes and parallel requests cannot add or queue a recipient twice. More recipients can be
+added later; existing Sent / Pending / Failed recipients are never touched or resent. *Retry*
+(one or all failed) adds a new attempt for the same recipient; *Resume* asks the worker to run
+now (a provider quota pause is still respected). **Delivery report:** totals, sent %, first/last
+send, per-recipient list with search, status filter and CSV export, and each recipient's
+attempt history.
+
+Migration: `20261011090000_notices` (new tables `Notice`, `NoticeRecipient`, `NoticeEvent`,
+nullable `EmailOutbox.noticeRecipientId`; nothing existing is changed).
 
 ## 35. Google Drive
 

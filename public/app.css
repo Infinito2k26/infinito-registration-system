@@ -195,4 +195,4 @@ a.counter { text-decoration: none; color: inherit; display: block; }
 a.counter:hover { border-color: var(--accent); }
 a.counter.active { border: 2px solid var(--accent); box-shadow: 0 0 0 2px var(--info-bg); }
 .registration.highlight { border: 2px solid var(--accent); }
-
+.notice-preview { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); padding: 4px 16px; max-height: 420px; overflow: auto; overflow-wrap: anywhere; }

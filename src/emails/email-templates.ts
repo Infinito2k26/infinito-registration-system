@@ -18,7 +18,36 @@ export const EmailTemplate = {
   StaffLogin: 'staff-login',
   /** Several students' own passes, sent together to one selected student. */
   CollegePasses: 'college-passes',
+  /** Admin notice (Admin → Notices): the same subject and message for every recipient. */
+  Notice: 'notice',
 } as const;
+
+/** http(s) links in a notice message (trailing punctuation is not part of the link). */
+const NOTICE_LINK = /https?:\/\/[^\s<>"']+[^\s<>"'.,;:!?)\]]/g;
+
+/**
+ * A notice message (plain text) as safe HTML: everything escaped, blank lines start a new
+ * paragraph, line breaks kept, and http(s) links made clickable. No HTML from the admin is used.
+ */
+export function noticeBodyHtml(body: string): string {
+  const linkify = (text: string) => {
+    let out = '';
+    let last = 0;
+    for (const m of text.matchAll(NOTICE_LINK)) {
+      const url = escapeHtml(m[0]);
+      out += escapeHtml(text.slice(last, m.index)) + `<a href="${url}" style="color:#3b4cca">${url}</a>`;
+      last = m.index + m[0].length;
+    }
+    return out + escapeHtml(text.slice(last));
+  };
+  return noticeText(body)
+    .split(/\n{2,}/)
+    .map((para) => `<p>${linkify(para).replace(/\n/g, '<br>')}</p>`)
+    .join('\n');
+}
+
+/** The notice message as sent in the plain-text part (normalised line endings). */
+export const noticeText = (body: string) => body.replace(/\r\n?/g, '\n').trim();
 
 export interface CollegePass {
   name: string;
@@ -134,6 +163,10 @@ ${passes.map((p) => `- ${p.name} (${p.events})`).join('\n')}`,
         })),
       };
     }
+
+    case EmailTemplate.Notice:
+      // The subject/message snapshot taken when the delivery was queued (the notice is locked then).
+      return { html: layout(noticeBodyHtml(s(payload, 'body'))), text: noticeText(s(payload, 'body')) };
 
     case EmailTemplate.StaffLogin:
       return {

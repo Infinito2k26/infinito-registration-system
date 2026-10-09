@@ -44,7 +44,7 @@ export async function resetDatabase(ctx: Ctx) {
   throttle.storage?.clear();
   throttle.hitExpirations?.clear();
   await ctx.prisma.$executeRawUnsafe(
-    'TRUNCATE "RegistrationActivity","EmailOutbox","EmailBatch","EntryLog","Registration","TeamMember","Team","PersonEmailAlias","Person","ParticipantProfile","RegistrationDeletion","College","StaffSession","StaffUser" CASCADE',
+    'TRUNCATE "RegistrationActivity","EmailOutbox","EmailBatch","EntryLog","Registration","TeamMember","Team","PersonEmailAlias","Person","ParticipantProfile","RegistrationDeletion","NoticeEvent","NoticeRecipient","Notice","College","StaffSession","StaffUser" CASCADE',
   );
 }
 
