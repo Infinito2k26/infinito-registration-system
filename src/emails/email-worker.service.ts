@@ -85,6 +85,11 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
     return provider === 'smtp' ? new SmtpTransport(smtp, from, replyTo) : new ResendTransport(resendApiKey, from, replyTo);
   }
 
+  /** Until when the queue is paused (quota, rate limit, bad login), or null when it is not. */
+  get pausedUntilAt(): Date | null {
+    return this.pausedUntil > Date.now() ? new Date(this.pausedUntil) : null;
+  }
+
   get transportName() {
     return this.transport?.name ?? 'disabled';
   }
@@ -191,11 +196,23 @@ export class EmailWorkerService implements OnApplicationBootstrap, OnModuleDestr
       if (limit <= 0) return 0;
     }
 
+    // Participant emails (QR passes, login links...) first; admin notice deliveries fill the rest
+    // of the batch, so a large notice never delays a QR pass.
+    const dueWhere = { status: EmailStatus.PENDING, sendAt: { lte: now } };
     const due = await this.prisma.emailOutbox.findMany({
-      where: { status: EmailStatus.PENDING, sendAt: { lte: now } },
+      where: { ...dueWhere, noticeRecipientId: null },
       orderBy: { sendAt: 'asc' },
       take: limit,
     });
+    if (due.length < limit) {
+      due.push(
+        ...(await this.prisma.emailOutbox.findMany({
+          where: { ...dueWhere, noticeRecipientId: { not: null } },
+          orderBy: { sendAt: 'asc' },
+          take: limit - due.length,
+        })),
+      );
+    }
 
     let sent = 0;
     for (const row of due) {

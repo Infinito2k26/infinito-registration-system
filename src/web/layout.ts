@@ -81,13 +81,14 @@ export type NavSection =
   | 'find'
   | 'verifications'
   | 'aadhaar'
+  | 'notices'
   | 'staff';
 
 /**
  * Navigation per role. This only decides what is shown; every target route is also protected
  * on the server (@Roles / StaffGuard), so a hidden item is never the only barrier.
  *   ADMIN:       Dashboard, Inside, Outside, Ever entered, Blocked, Arrivals, Gate log, Colleges, Scan,
- *                Verification log, Aadhaar duplicates, Staff
+ *                Verification log, Aadhaar duplicates, Notices, Staff
  *   COORDINATOR: the same without Staff
  *   VOLUNTEER:   Scan, Find participant
  */
@@ -112,6 +113,7 @@ export function navItems(role: StaffRole): { key: NavSection; href: string; labe
       ? [
           { key: 'verifications' as const, href: '/admin/verification-report', label: 'Verification log' },
           { key: 'aadhaar' as const, href: '/admin/aadhaar-duplicates', label: 'Aadhaar duplicates' },
+          { key: 'notices' as const, href: '/admin/notices', label: 'Notices' },
           { key: 'staff' as const, href: '/admin/staff', label: 'Staff' },
         ]
       : []),

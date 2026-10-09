@@ -140,6 +140,7 @@ model Person {
   emailAliases       PersonEmailAlias[]
   participantProfile ParticipantProfile? @relation(fields: [participantProfileId], references: [id], onDelete: SetNull)
   batchesReceived    EmailBatch[]
+  noticeRecipients   NoticeRecipient[]
   blockedBy          StaffUser?          @relation("PersonBlockedBy", fields: [blockedById], references: [id], onDelete: SetNull)
 
   @@index([profileCompletedAt])
@@ -322,6 +323,8 @@ model StaffUser {
   verificationBatches   VerificationBatch[]
   settingsUpdated       SystemSetting[]
   registrationDeletions RegistrationDeletion[]
+  noticesCreated        Notice[]
+  noticeEvents          NoticeEvent[]
   blockedPeople         Person[]               @relation("PersonBlockedBy")
 }
 
@@ -349,6 +352,8 @@ model EmailOutbox {
   triggeredById     String?              @db.Uuid
   /// Bulk college send this email belongs to.
   batchId           String?              @db.Uuid
+  /// Admin notice delivery (one row per attempt) for this notice recipient.
+  noticeRecipientId String?              @db.Uuid
   toEmail           String
   /// e.g. "qr-pass:<registrationId>:initial". Enqueueing the same key twice is a no-op; also sent to Resend as its Idempotency-Key.
   idempotencyKey    String               @unique
@@ -372,9 +377,12 @@ model EmailOutbox {
   triggeredBy       StaffUser?              @relation(fields: [triggeredById], references: [id], onDelete: SetNull)
   batch             EmailBatch?             @relation(fields: [batchId], references: [id], onDelete: SetNull)
   verificationItems VerificationBatchItem[]
+  noticeRecipient   NoticeRecipient?        @relation("NoticeDeliveries", fields: [noticeRecipientId], references: [id], onDelete: SetNull)
+  currentFor        NoticeRecipient?        @relation("NoticeCurrentDelivery")
 
   @@index([status, sendAt])
   @@index([batchId])
+  @@index([noticeRecipientId])
   @@index([registrationId, template])
 }
 
@@ -497,4 +505,73 @@ model RegistrationDeletion {
   deletedBy StaffUser? @relation(fields: [deletedById], references: [id], onDelete: SetNull)
 
   @@index([responseId, eventSlug, personId])
+}
+
+enum NoticeStatus {
+  /// Saved, still being written: can be edited and test-sent, not sent to participants.
+  DRAFT
+  /// Saved as final: can be sent. Subject and message lock when the first delivery is queued.
+  READY
+}
+
+/// Admin notice emailed privately (one recipient per email) to selected participants.
+/// Deliveries are EmailOutbox rows sent by the normal email worker.
+model Notice {
+  id          String       @id @default(uuid()) @db.Uuid
+  title       String
+  subject     String
+  /// Plain text (escaped when rendered; links made clickable).
+  body        String
+  status      NoticeStatus @default(DRAFT)
+  createdById String?      @db.Uuid
+  /// Set when the first delivery is queued: subject and message can no longer change, so every
+  /// recipient gets the same version.
+  lockedAt    DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  createdBy  StaffUser?        @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  recipients NoticeRecipient[]
+  events     NoticeEvent[]
+
+  @@index([createdAt])
+}
+
+/// One recipient (one email address) of a notice. No row = "Not yet selected".
+model NoticeRecipient {
+  id       String    @id @default(uuid()) @db.Uuid
+  noticeId String    @db.Uuid
+  personId String?   @db.Uuid
+  /// Snapshots at selection time: the address used for this notice and the name shown.
+  name     String?
+  /// Lowercased; one recipient per address per notice.
+  email    String
+  addedAt  DateTime  @default(now())
+  /// Current delivery (latest attempt). Null = selected, not queued yet (awaiting confirmation).
+  outboxId String?   @unique @db.Uuid
+  queuedAt DateTime?
+
+  notice     Notice        @relation(fields: [noticeId], references: [id], onDelete: Cascade)
+  person     Person?       @relation(fields: [personId], references: [id], onDelete: SetNull)
+  outbox     EmailOutbox?  @relation("NoticeCurrentDelivery", fields: [outboxId], references: [id], onDelete: SetNull)
+  deliveries EmailOutbox[] @relation("NoticeDeliveries")
+
+  @@unique([noticeId, email])
+  @@unique([noticeId, personId])
+  @@index([personId])
+}
+
+/// Audit trail of a notice (created, edited, recipients added/removed, queued, retried...).
+model NoticeEvent {
+  id        String   @id @default(uuid()) @db.Uuid
+  noticeId  String   @db.Uuid
+  type      String
+  actorId   String?  @db.Uuid
+  details   Json?
+  createdAt DateTime @default(now())
+
+  notice Notice     @relation(fields: [noticeId], references: [id], onDelete: Cascade)
+  actor  StaffUser? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([noticeId, createdAt])
 }

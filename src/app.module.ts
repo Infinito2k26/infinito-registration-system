@@ -7,6 +7,7 @@ import { AppConfigModule } from './config/app-config.service';
 import { EntryModule } from './entry/entry.module';
 import { FormsModule } from './forms/forms.module';
 import { HealthModule } from './health/health.module';
+import { NoticesModule } from './notices/notices.module';
 import { PrismaModule } from './prisma/prisma.module';
 
 @Module({
@@ -25,6 +26,7 @@ import { PrismaModule } from './prisma/prisma.module';
     AuthModule,
     AdminModule,
     EntryModule,
+    NoticesModule,
   ],
 })
 export class AppModule {}
